@@ -1,0 +1,6 @@
+aiohttp
+Pillow
+arabic-reshaper
+python-bidi
+jdatetime
+opencv-python-headless
