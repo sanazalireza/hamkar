@@ -2,7 +2,7 @@ name: ShirazLastNews Studio Bot
 
 on:
   schedule:
-    # 06:00، 11:00، 16:00 و 19:30 به وقت تهران (پوشش کامل ۶ صبح تا ۱۲ شب)
+    # 06:00، 11:00، 16:00 و 19:30 به وقت تهران
     - cron: '30 2 * * *'
     - cron: '30 7 * * *'
     - cron: '30 12 * * *'
@@ -26,10 +26,10 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install FFmpeg and Persian Fonts
+      - name: Install FFmpeg, Raqm and Persian Fonts
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg fonts-vazirmatn
+          sudo apt-get install -y -qq ffmpeg libraqm0 libfribidi0 libharfbuzz0b
           mkdir -p fonts
           curl -sL "https://raw.githubusercontent.com/rastikerdar/vazirmatn/master/fonts/ttf/Vazirmatn-Bold.ttf" -o fonts/Vazirmatn-Bold.ttf || true
           curl -sL "https://raw.githubusercontent.com/rastikerdar/vazirmatn/master/fonts/ttf/Vazirmatn-Regular.ttf" -o fonts/Vazirmatn-Regular.ttf || true
