@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import ctypes.util
 import io
 import json
 import math
@@ -7,17 +8,30 @@ import os
 import random
 import re
 import shutil
+import struct
 import subprocess
 import tempfile
 import time
+import wave
 from datetime import datetime, timedelta, timezone
+
+# نصب خودکار موتور فارسی‌نویس (libraqm0) قبل از بارگذاری Pillow بدون نیاز به تغییر bot.yml
+if not ctypes.util.find_library("raqm") and shutil.which("apt-get"):
+    _r = subprocess.run(
+        ["sudo", "apt-get", "install", "-y", "-qq", "libraqm0"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if _r.returncode != 0:
+        subprocess.run(["sudo", "apt-get", "update", "-qq"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["sudo", "apt-get", "install", "-y", "-qq", "libraqm0"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 import aiohttp
 import arabic_reshaper
 import cv2
 import jdatetime
 from bidi.algorithm import get_display
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, features
 
 # ==================== تنظیمات محیطی ====================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -38,6 +52,7 @@ MAX_RUN_SECONDS = 5 * 3600 + 30 * 60
 
 BRAND_HANDLE = "@shirazlastnews"
 BRAND_TITLE_FA = "آخرین خبرهای شیراز"
+HAS_RAQM = features.check("raqm")
 
 # ==================== پرامپت دقیق سردبیری ۶ بخشی ====================
 EDITORIAL_CAPTION_PROMPT = """تو سردبیر ارشد یک رسانه خبری معتبر و رسمی در اینستاگرام با آیدی @shirazlastnews هستی.
@@ -84,10 +99,11 @@ EDITORIAL_CAPTION_PROMPT = """تو سردبیر ارشد یک رسانه خبر�
 - اگر خبر محلی است، ۲ هشتگ اول حتماً #شیراز و #استان_فارس باشند و ۳ هشتگ بعدی تخصصیِ موضوع خبر.
 - خط قرمز: از هشتگ‌های اسپم مثل #اکسپلور #وایرال #explore #viral هرگز استفاده نکن. هشتگ #حوادث را فقط و فقط زمانی به کار ببر که دسته خبر «حوادث» باشد."""
 
-# ==================== تم‌های گرافیکی (تغییر آنی تم) ====================
+# ==================== تم‌های گرافیکی ====================
 THEMES = {
     "navy": {
-        "name": "رسمی سرمه‌ای 🔵",
+        "name": "تم رسمی سرمه‌ای 🔵",
+        "btn": "🔵 تم رسمی سرمه‌ای",
         "bg": (11, 27, 52),
         "accent": (234, 179, 8),
         "badge_bg": (220, 38, 38),
@@ -97,7 +113,8 @@ THEMES = {
         "wave_hex": "0xEAB308",
     },
     "incident": {
-        "name": "فوری و حادثه‌ای 🔴",
+        "name": "تم فوری و حادثه‌ای 🔴",
+        "btn": "🔴 تم فوری و حادثه‌ای",
         "bg": (18, 12, 14),
         "accent": (220, 38, 38),
         "badge_bg": (220, 38, 38),
@@ -107,7 +124,8 @@ THEMES = {
         "wave_hex": "0xEF4444",
     },
     "mourning": {
-        "name": "سوگواری مشکی-نقره‌ای 🖤",
+        "name": "تم سوگواری مشکی-نقره‌ای 🖤",
+        "btn": "🖤 تم سوگواری",
         "bg": (12, 12, 15),
         "accent": (180, 188, 198),
         "badge_bg": (55, 65, 81),
@@ -117,7 +135,8 @@ THEMES = {
         "wave_hex": "0xCBD5E1",
     },
     "sports": {
-        "name": "ورزشی سبز 🟢",
+        "name": "تم ورزشی سبز 🟢",
+        "btn": "🟢 تم ورزشی",
         "bg": (6, 40, 30),
         "accent": (34, 197, 94),
         "badge_bg": (22, 163, 74),
@@ -128,9 +147,8 @@ THEMES = {
     },
 }
 
-# ==================== بانک مختصات شیراز و شهرهای فارس ====================
+# ==================== بانک مختصات محله‌های شیراز و شهرهای فارس ====================
 FARS_LOCATIONS = {
-    "شیراز": (29.5918, 52.5837, 12),
     "معالی آباد": (29.6712, 52.4638, 15),
     "معالی‌آباد": (29.6712, 52.4638, 15),
     "صدرا": (29.7984, 52.4970, 14),
@@ -176,10 +194,11 @@ FARS_LOCATIONS = {
     "اوز": (27.7611, 54.0067, 13),
     "پاسارگاد": (30.1942, 53.1670, 13),
     "سروستان": (29.2735, 53.2202, 13),
+    "شیراز": (29.5918, 52.5837, 12),
     "فارس": (29.5918, 52.5837, 8),
 }
 
-# ==================== بانک مناسبت‌های شمسی ====================
+# ==================== بانک مناسبت‌های شمسی و سپر ضدشدوبن ====================
 JALALI_MONTHS = [
     "", "فروردین", "اردیبهشت", "خرداد", "تیر", "مرداد", "شهریور",
     "مهر", "آبان", "آذر", "دی", "بهمن", "اسفند"
@@ -219,7 +238,6 @@ SHAMSI_OCCASIONS = {
     (12, 29): "روز ملی شدن صنعت نفت ایران",
 }
 
-# ==================== کلمات حساس سپر ضدشدوبن ====================
 SENSITIVE_WORDS = {
     "قتل": "جان‌باختن / حادثه تلخ",
     "خودکشی": "پایان دادن به زندگی / حادثه شخصی",
@@ -244,15 +262,32 @@ SENSITIVE_WORDS = {
     "اسلحه": "سلاح",
 }
 
-# ==================== تنظیمات قابل ذخیره در پیام پین‌شده ====================
+# ==================== برچسب دکمه‌های منوی ثابت پایین صفحه ====================
+BTN_CARD_POST = "🖼️ کارت پست (۴:۵)"
+BTN_CARD_STORY = "📱 کارت استوری (۹:۱۶)"
+BTN_INCIDENT = "🚨 ریلز فوری و حادثه‌ای"
+BTN_CAPTION = "✍️ کپشن‌نویس فعال"
+BTN_MAP = "🗺️ ریلز زوم نقشه"
+BTN_AUDIO = "🎙️ ریلز موج صوتی"
+BTN_DAILY60 = "🎬 ریلز جمع‌بندی ۶۰ ثانیه‌ای"
+BTN_VIDEO = "🎞️ استودیو تدوین ویدئو"
+BTN_SHADOWBAN = "🛡️ سپر ضدشدوبن"
+BTN_THEME = "🎨 تغییر تم گرافیکی"
+BTN_OCCASION = "📅 کارت مناسبت امروز"
+BTN_STATUS = "📊 وضعیت استودیو"
+BTN_BACK = "🔙 بازگشت به منوی اصلی"
+BTN_CANCEL = "❌ انصراف و بازگشت"
+BTN_SKIP_PHOTO = "⏭️ بدون عکس گوینده"
+BTN_SAFE_REWRITE = "✨ بازنویسی ایمن آخرین کپشن"
+
 CONFIG = {
-    "theme": "navy",           # navy | incident | mourning | sports
-    "use_repo_frame": True,    # استفاده از عکس قاب ریلز آپلودشده در مخزن (reel_frame.png)
-    "video_antidup": True,     # اصالت‌سازی و حذف متادیتا
-    "video_facetrack": True,   # افقی به عمودی ۹:۱۶ با ردیابی چهره
-    "video_brand": True,       # بسته‌بندی برند (قاب ریلز / Lower-Third + اند-اسکرین ۲ ثانیه‌ای)
-    "auto_shadowban": True,    # اسکن خودکار ضدشدوبن زیر کپشن‌ها
-    "auto_daily_card": True,   # ارسال خودکار کارت مناسبت صبح‌ها
+    "theme": "navy",
+    "use_repo_frame": True,
+    "video_antidup": True,
+    "video_facetrack": True,
+    "video_brand": True,
+    "auto_shadowban": True,
+    "auto_daily_card": True,
     "last_occasion_date": "",
 }
 
@@ -264,9 +299,44 @@ LAST_CAPTION = {}
 DAILY_ITEMS = []
 BG_TASKS = set()
 TMP_ROOT = tempfile.mkdtemp(prefix="shiraz_studio_")
+# ==================== ابزارهای کمکی، ساخت صدای خبری و اجرای امن FFmpeg ====================
+def run_ffmpeg(cmd: list):
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if res.returncode != 0:
+        err_lines = [ln.strip() for ln in res.stderr.splitlines() if ln.strip()]
+        tail = "\n".join(err_lines[-4:]) if err_lines else f"exit code {res.returncode}"
+        raise RuntimeError(tail)
 
 
-# ==================== ابزارهای کمکی و شناسایی قاب ریلز مخزن ====================
+def generate_news_audio_wav(out_path: str, duration_sec: float, mode: str = "news") -> str:
+    """ساخت مستقیم فایل صوتی WAV با پایتون (حذف کامل aevalsrc و رفع قطعی ارور 234 در FFmpeg)."""
+    sr = 44100
+    n_samples = int(sr * duration_sec)
+    frames = bytearray()
+    two_pi = 2.0 * math.pi
+
+    for i in range(n_samples):
+        t = i / sr
+        if mode == "incident":
+            pulse = 0.5 + 0.5 * math.sin(two_pi * 2.2 * t)
+            beat = 1.0 if (t % 0.75) > 0.60 else 0.0
+            val = 0.16 * math.sin(two_pi * 75.0 * t) * pulse + 0.05 * math.sin(two_pi * 220.0 * t) * beat
+        else:
+            pulse = 0.5 + 0.5 * math.sin(two_pi * 1.5 * t)
+            beat = 1.0 if (t % 1.2) > 1.05 else 0.0
+            val = 0.11 * math.sin(two_pi * 110.0 * t) * pulse + 0.035 * math.sin(two_pi * 330.0 * t) * beat
+
+        sample = max(-32767, min(32767, int(val * 32767)))
+        frames += struct.pack("<h", sample)
+
+    with wave.open(out_path, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes(frames)
+    return out_path
+
+
 def get_tehran_now() -> datetime:
     return datetime.now(TEHRAN_TZ)
 
@@ -274,7 +344,6 @@ def get_tehran_now() -> datetime:
 def should_keep_running(boot_time: float) -> bool:
     if (time.time() - boot_time) >= MAX_RUN_SECONDS:
         return False
-    # در اجرای دستی (Run workflow) همیشه فعال بماند حتی در ساعات نیمه‌شب
     if EVENT_NAME == "workflow_dispatch":
         return True
     now = get_tehran_now()
@@ -286,23 +355,20 @@ def is_admin(user_id: str) -> bool:
 
 
 def find_repo_reel_frame() -> str:
-    """جستجوی خودکار عکس قاب ریلز بارگذاری‌شده در مخزن گیت‌هاب."""
-    candidates = [
+    for path in (
         "reel_frame.png",
         "assets/reel_frame.png",
         "reel_overlay.png",
         "assets/reel_overlay.png",
         "frame.png",
         "assets/frame.png",
-    ]
-    for path in candidates:
+    ):
         if os.path.exists(path) and os.path.getsize(path) > 1000:
             return path
     return ""
 
 
 def find_repo_incident_frame() -> str:
-    """در صورت آپلود قاب اختصاصی برای اخبار حادثه‌ای."""
     for path in ("incident_frame.png", "assets/incident_frame.png"):
         if os.path.exists(path) and os.path.getsize(path) > 1000:
             return path
@@ -310,7 +376,6 @@ def find_repo_incident_frame() -> str:
 
 
 def prepare_rgba_frame_1080x1920(src_path: str, work_dir: str) -> str:
-    """آماده‌سازی دقیق قاب ریلز مخزن در سایز ۱۰۸۰×۱۹۲۰ با حفظ شفافیت PNG."""
     img = Image.open(src_path).convert("RGBA")
     if img.size != (1080, 1920):
         img = img.resize((1080, 1920), Image.Resampling.LANCZOS)
@@ -334,18 +399,13 @@ def to_persian_digits(text: str) -> str:
     return text
 
 
-def fa_shape(text: str) -> str:
-    if not text:
-        return ""
-    return get_display(arabic_reshaper.reshape(text))
-
-
 def find_font_path(kind: str = "bold") -> str:
+    if not HAS_RAQM and kind == "display":
+        kind = "bold"
     candidates = {
         "display": [
             "fonts/Lalezar-Regular.ttf",
             "fonts/Vazirmatn-Bold.ttf",
-            "/usr/share/fonts/truetype/vazirmatn/Vazirmatn-Bold.ttf",
         ],
         "bold": [
             "fonts/Vazirmatn-Bold.ttf",
@@ -354,6 +414,7 @@ def find_font_path(kind: str = "bold") -> str:
         ],
         "regular": [
             "fonts/Vazirmatn-Regular.ttf",
+            "fonts/Vazirmatn-Bold.ttf",
             "/usr/share/fonts/truetype/vazirmatn/Vazirmatn-Regular.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         ],
@@ -371,13 +432,25 @@ def load_font(kind: str, size: int) -> ImageFont.FreeTypeFont:
         return ImageFont.load_default()
 
 
+def prepare_text_and_kwargs(text: str, is_rtl: bool = True) -> tuple:
+    """وقتی Raqm فعال باشد متن خام فارسی با direction='rtl' رسم می‌شود تا حروف پیوسته و بدون مربع باشند."""
+    if HAS_RAQM:
+        if is_rtl:
+            return text, {"direction": "rtl", "language": "fa"}
+        return text, {"direction": "ltr"}
+    if is_rtl:
+        return get_display(arabic_reshaper.reshape(text)), {}
+    return text, {}
+
+
 def wrap_persian_lines(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont, max_width: int, max_lines: int = 4) -> list:
     words = text.replace("\n", " ").split()
     lines = []
     cur = []
     for w in words:
         trial = " ".join(cur + [w])
-        bbox = draw.textbbox((0, 0), fa_shape(trial), font=font)
+        t_draw, kw = prepare_text_and_kwargs(trial, is_rtl=True)
+        bbox = draw.textbbox((0, 0), t_draw, font=font, **kw)
         if (bbox[2] - bbox[0]) <= max_width or not cur:
             cur.append(w)
         else:
@@ -399,18 +472,22 @@ def draw_rtl_text(
     align: str = "center",
     shadow: bool = True,
     shadow_offset: int = 4,
+    is_rtl: bool = True,
 ):
-    shaped = fa_shape(text)
-    bbox = draw.textbbox((0, 0), shaped, font=font)
-    tw = bbox[2] - bbox[0]
+    if not text:
+        return
+    t_draw, kw = prepare_text_and_kwargs(text, is_rtl=is_rtl)
+    bbox = draw.textbbox((0, 0), t_draw, font=font, **kw)
     x, y = xy
     if align == "center":
-        x = x - tw // 2
+        x = x - (bbox[0] + bbox[2]) // 2
     elif align == "right":
-        x = x - tw
+        x = x - bbox[2]
+    else:
+        x = x - bbox[0]
     if shadow:
-        draw.text((x + shadow_offset, y + shadow_offset), shaped, font=font, fill=(0, 0, 0, 185))
-    draw.text((x, y), shaped, font=font, fill=fill)
+        draw.text((x + shadow_offset, y + shadow_offset), t_draw, font=font, fill=(0, 0, 0, 185), **kw)
+    draw.text((x, y), t_draw, font=font, fill=fill, **kw)
 
 
 def fit_cover(img: Image.Image, target_w: int, target_h: int) -> Image.Image:
@@ -459,6 +536,96 @@ def add_to_daily_items(headline: str, photo_path: str = None, tag: str = "خبر
                 pass
 
 
+# ==================== کیبوردهای ثابت منوی پایین صفحه (Reply Keyboard) ====================
+def kb_main_menu() -> dict:
+    return {
+        "keyboard": [
+            [{"text": BTN_CARD_POST}, {"text": BTN_CARD_STORY}],
+            [{"text": BTN_INCIDENT}],
+            [{"text": BTN_CAPTION}],
+            [{"text": BTN_MAP}, {"text": BTN_AUDIO}],
+            [{"text": BTN_DAILY60}],
+            [{"text": BTN_VIDEO}],
+            [{"text": BTN_SHADOWBAN}, {"text": BTN_THEME}],
+            [{"text": BTN_OCCASION}, {"text": BTN_STATUS}],
+        ],
+        "resize_keyboard": True,
+        "is_persistent": True,
+    }
+
+
+def kb_cancel(extra_row: list = None) -> dict:
+    rows = []
+    if extra_row:
+        rows.append(extra_row)
+    rows.append([{"text": BTN_CANCEL}])
+    return {"keyboard": rows, "resize_keyboard": True, "is_persistent": True}
+
+
+def kb_theme_menu() -> dict:
+    return {
+        "keyboard": [
+            [{"text": THEMES["navy"]["btn"]}, {"text": THEMES["incident"]["btn"]}],
+            [{"text": THEMES["mourning"]["btn"]}, {"text": THEMES["sports"]["btn"]}],
+            [{"text": BTN_BACK}],
+        ],
+        "resize_keyboard": True,
+        "is_persistent": True,
+    }
+
+
+def kb_video_studio() -> dict:
+    def st(b):
+        return "روشن ✅" if b else "خاموش ❌"
+
+    return {
+        "keyboard": [
+            [{"text": f"🖼️ قاب ریلز مخزن: {st(CONFIG['use_repo_frame'])}"}],
+            [{"text": f"🧬 اصالت‌سازی و حذف متادیتا: {st(CONFIG['video_antidup'])}"}],
+            [{"text": f"👤 ردیابی چهره ۹:۱۶: {st(CONFIG['video_facetrack'])}"}],
+            [{"text": f"🏷️ اند-اسکرین دعوت به فالو: {st(CONFIG['video_brand'])}"}],
+            [{"text": BTN_BACK}],
+        ],
+        "resize_keyboard": True,
+        "is_persistent": True,
+    }
+
+
+def kb_shadowban_actions() -> dict:
+    return {
+        "keyboard": [
+            [{"text": BTN_SAFE_REWRITE}],
+            [{"text": BTN_BACK}],
+        ],
+        "resize_keyboard": True,
+        "is_persistent": True,
+    }
+
+
+def build_status_text() -> str:
+    now_str = to_persian_digits(get_tehran_now().strftime("%H:%M"))
+    t_name = THEMES[CONFIG["theme"]]["name"]
+    ai_status = "متصل ✅" if GEMINI_API_KEY else "کلید GEMINI_API_KEY ثبت نشده ⚠️"
+    raqm_status = "فعال ✅ (فونت فارسی سالم)" if HAS_RAQM else "حالت پشتیبان"
+
+    repo_fr = find_repo_reel_frame()
+    if repo_fr:
+        fr_status = f"فعال ✅ ({os.path.basename(repo_fr)})" if CONFIG["use_repo_frame"] else f"موجود ولی خاموش ⏸ ({os.path.basename(repo_fr)})"
+    else:
+        fr_status = "آپلود نشده (نام فایل: reel_frame.png)"
+
+    return (
+        f"🎬 استودیوی تولید محتوای {BRAND_HANDLE}\n\n"
+        f"🕒 ساعت تهران: {now_str}\n"
+        f"🎨 تم فعال: {t_name}\n"
+        f"🖼️ قاب ریلز مخزن: {fr_status}\n"
+        f"🔤 موتور فارسی‌نویس: {raqm_status}\n"
+        f"🧠 هوش مصنوعی سردبیری: {ai_status}\n"
+        f"📦 خبرهای صف جمع‌بندی ۶۰ ثانیه‌ای امروز: {to_persian_digits(str(len(DAILY_ITEMS)))} مورد\n\n"
+        "از دکمه‌های منوی پایین صفحه، ابزار موردنظر را انتخاب کنید:"
+    )
+
+
 # ==================== ارتباط با Telegram API ====================
 async def tg_api(session: aiohttp.ClientSession, method: str, payload: dict):
     if not BOT_TOKEN:
@@ -480,40 +647,29 @@ async def send_message(session: aiohttp.ClientSession, chat_id: str, text: str, 
     return await tg_api(session, "sendMessage", payload)
 
 
-async def edit_message(session: aiohttp.ClientSession, chat_id: str, message_id: int, text: str, reply_markup: dict = None):
-    payload = {"chat_id": chat_id, "message_id": message_id, "text": text[:4090]}
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
-    await tg_api(session, "editMessageText", payload)
-
-
-async def answer_callback(session: aiohttp.ClientSession, callback_id: str, text: str = "", show_alert: bool = False):
-    payload = {"callback_query_id": callback_id}
-    if text:
-        payload["text"] = text[:190]
-        payload["show_alert"] = show_alert
-    await tg_api(session, "answerCallbackQuery", payload)
-
-
-async def send_photo_file(session: aiohttp.ClientSession, chat_id: str, path: str, caption: str = ""):
+async def send_photo_file(session: aiohttp.ClientSession, chat_id: str, path: str, caption: str = "", reply_markup: dict = None):
     url = f"[https://api.telegram.org/bot](https://api.telegram.org/bot){BOT_TOKEN}/sendPhoto"
     form = aiohttp.FormData()
     form.add_field("chat_id", str(chat_id))
     if caption:
         form.add_field("caption", caption[:1000])
+    if reply_markup:
+        form.add_field("reply_markup", json.dumps(reply_markup, ensure_ascii=False))
     with open(path, "rb") as f:
         form.add_field("photo", f.read(), filename=os.path.basename(path), content_type="image/jpeg")
     async with session.post(url, data=form, timeout=aiohttp.ClientTimeout(total=60)) as resp:
         return await resp.json()
 
 
-async def send_video_file(session: aiohttp.ClientSession, chat_id: str, path: str, caption: str = ""):
+async def send_video_file(session: aiohttp.ClientSession, chat_id: str, path: str, caption: str = "", reply_markup: dict = None):
     url = f"[https://api.telegram.org/bot](https://api.telegram.org/bot){BOT_TOKEN}/sendVideo"
     form = aiohttp.FormData()
     form.add_field("chat_id", str(chat_id))
     form.add_field("supports_streaming", "true")
     if caption:
         form.add_field("caption", caption[:1000])
+    if reply_markup:
+        form.add_field("reply_markup", json.dumps(reply_markup, ensure_ascii=False))
     with open(path, "rb") as f:
         form.add_field("video", f.read(), filename=os.path.basename(path), content_type="video/mp4")
     async with session.post(url, data=form, timeout=aiohttp.ClientTimeout(total=180)) as resp:
@@ -583,7 +739,7 @@ async def save_config_to_pin(session: aiohttp.ClientSession):
         })
 
 
-# ==================== موتور هوش مصنوعی Gemini (متن، عکس، صدا و فیلم) ====================
+# ==================== موتور هوش مصنوعی Gemini ====================
 async def gemini_upload_file(session: aiohttp.ClientSession, file_path: str, mime_type: str) -> str:
     file_size = os.path.getsize(file_path)
     init_url = f"[https://generativelanguage.googleapis.com/upload/v1beta/files?key=](https://generativelanguage.googleapis.com/upload/v1beta/files?key=){GEMINI_API_KEY}"
@@ -742,9 +898,7 @@ async def rewrite_shadowban_safe(session: aiohttp.ClientSession, caption_text: s
     )
     res = await gemini_generate(session, p)
     return res or caption_text
-
-
-# ==================== ۱. کارت‌ساز پست و استوری ====================
+    # ==================== ۱. کارت‌ساز پست (۴:۵) و استوری (۹:۱۶) ====================
 def render_news_card_sync(photo_path: str, badge: str, headline: str, subtext: str, fmt: str = "post", theme_key: str = "navy") -> str:
     theme = THEMES.get(theme_key, THEMES["navy"])
     w, h = (1080, 1350) if fmt == "post" else (1080, 1920)
@@ -780,17 +934,18 @@ def render_news_card_sync(photo_path: str, badge: str, headline: str, subtext: s
     date_str = to_persian_digits(f"{jnow.day} {JALALI_MONTHS[jnow.month]} {jnow.year}")
 
     draw_rtl_text(draw, (w - 54, 46), BRAND_TITLE_FA, f_brand, theme["text"] + (255,), align="right")
-    draw.text((54, 52), BRAND_HANDLE, font=f_handle, fill=theme["accent"] + (255,))
-    draw_rtl_text(draw, (w - 54, 94), date_str, load_font("regular", 24), theme["subtext"] + (230,), align="right", shadow=False)
+    draw_rtl_text(draw, (54, 52), BRAND_HANDLE, f_handle, theme["accent"] + (255,), align="left", shadow=False, is_rtl=False)
+    draw_rtl_text(draw, (w - 54, 96), date_str, load_font("regular", 24), theme["subtext"] + (230,), align="right", shadow=False)
 
     f_badge = load_font("bold", 34)
-    bb = draw.textbbox((0, 0), fa_shape(badge), font=f_badge)
+    b_txt, b_kw = prepare_text_and_kwargs(badge, is_rtl=True)
+    bb = draw.textbbox((0, 0), b_txt, font=f_badge, **b_kw)
     bw = (bb[2] - bb[0]) + 56
     bh = 62
 
     f_title = load_font("display", 78 if fmt == "story" else 70)
     lines = wrap_persian_lines(draw, headline, f_title, w - 120, max_lines=3)
-    line_h = 102 if fmt == "story" else 92
+    line_h = 104 if fmt == "story" else 94
     block_h = len(lines) * line_h
 
     title_start_y = h - 245 - block_h if fmt == "post" else h - 380 - block_h
@@ -816,7 +971,7 @@ def render_news_card_sync(photo_path: str, badge: str, headline: str, subtext: s
     footer_y = h - 88 if fmt == "post" else h - 140
     draw.line([(54, footer_y - 18), (w - 54, footer_y - 18)], fill=theme["accent"] + (130,), width=2)
     draw_rtl_text(draw, (w - 54, footer_y), "پوشش لحظه‌ای اخبار شیراز و فارس", load_font("regular", 26), theme["subtext"] + (220,), align="right", shadow=False)
-    draw.text((54, footer_y), BRAND_HANDLE, font=load_font("bold", 28), fill=theme["accent"] + (255,))
+    draw_rtl_text(draw, (54, footer_y), BRAND_HANDLE, load_font("bold", 28), theme["accent"] + (255,), align="left", shadow=False, is_rtl=False)
 
     out_path = os.path.join(TMP_ROOT, f"card_{fmt}_{int(time.time()*1000)}.jpg")
     canvas.convert("RGB").save(out_path, quality=94)
@@ -894,9 +1049,9 @@ def build_incident_reel_sync(photo_path: str, headline: str, location_or_sub: st
     od.rectangle([(0, ticker_y), (w, ticker_y + 76)], fill=(185, 28, 28, 245))
     sub_line = location_or_sub.strip() if location_or_sub else "پوشش فوری حوادث شیراز، فارس و ایران"
     draw_rtl_text(od, (w // 2, ticker_y + 16), sub_line[:58], load_font("bold", 34), (255, 255, 255, 255), align="center", shadow=False)
-    draw_rtl_text(od, (w // 2, ticker_y + 106), f"{BRAND_TITLE_FA}  |  {BRAND_HANDLE}", load_font("bold", 32), (250, 204, 21, 255), align="center")
+    draw_rtl_text(od, (w - 60, ticker_y + 106), BRAND_TITLE_FA, load_font("bold", 32), (250, 204, 21, 255), align="right")
+    draw_rtl_text(od, (60, ticker_y + 106), BRAND_HANDLE, load_font("bold", 32), (250, 204, 21, 255), align="left", is_rtl=False)
 
-    # اگر کاربر قاب حادثه‌ای اختصاصی (incident_frame.png) آپلود کرده باشد، روی لایه می‌نشیند
     inc_frame = find_repo_incident_frame()
     if inc_frame:
         fr_img = Image.open(inc_frame).convert("RGBA").resize((w, h), Image.Resampling.LANCZOS)
@@ -905,26 +1060,27 @@ def build_incident_reel_sync(photo_path: str, headline: str, location_or_sub: st
     ov_path = os.path.join(work_dir, "overlay.png")
     ov.save(ov_path)
 
+    wav_path = generate_news_audio_wav(os.path.join(work_dir, "sfx.wav"), 14.0, mode="incident")
     out_mp4 = os.path.join(TMP_ROOT, f"incident_reel_{int(time.time()*1000)}.mp4")
+
     cmd = [
         "ffmpeg", "-y",
         "-i", bg_path,
         "-loop", "1", "-t", "14", "-i", glow_a,
         "-loop", "1", "-t", "14", "-i", glow_b,
         "-loop", "1", "-t", "14", "-i", ov_path,
-        "-f", "lavfi", "-t", "14",
-        "-i", "aevalsrc=0.14*sin(2*PI*75*t)*(0.5+0.5*sin(2*PI*2.2*t))+0.045*sin(2*PI*220*t)*gt(mod(t,0.75),0.60):s=44100",
+        "-i", wav_path,
         "-filter_complex",
-        "[0:v]zoompan=z='min(1.0+0.0005*on,1.15)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=350:s=1080x1920:fps=25,format=rgba[bg];"
-        "[bg][1:v]overlay=0:0:enable='lt(mod(t,0.9),0.45)'[s1];"
-        "[s1][2:v]overlay=0:0:enable='gte(mod(t,0.9),0.45)'[s2];"
+        "[0:v]zoompan=z='1+0.00042*on':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=350:s=1080x1920:fps=25,format=rgba[bg];"
+        "[bg][1:v]overlay=0:0:enable='floor(2*t)-2*floor(t)'[s1];"
+        "[s1][2:v]overlay=0:0:enable='1-(floor(2*t)-2*floor(t))'[s2];"
         "[s2][3:v]overlay=0:0,format=yuv420p[vout]",
         "-map", "[vout]", "-map", "4:a",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
         "-c:a", "aac", "-b:a", "128k",
         "-movflags", "+faststart", "-t", "14", out_mp4,
     ]
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    run_ffmpeg(cmd)
     shutil.rmtree(work_dir, ignore_errors=True)
     return out_mp4
 
@@ -941,10 +1097,10 @@ def latlon_to_tile(lat: float, lon: float, zoom: int):
 async def resolve_location_coords(session: aiohttp.ClientSession, loc_name: str):
     clean = loc_name.strip()
     for key, val in FARS_LOCATIONS.items():
-        if key in clean or clean in key:
+        if key in clean:
             return val
     try:
-        url = "[https://nominatim.openstreetmap.org/search](https://nominatim.openstreetmap.org/search)"
+        url = "https://nominatim.openstreetmap.org/search"
         params = {"q": f"{clean}, Iran", "format": "json", "limit": 1}
         headers = {"User-Agent": "ShirazLastNewsStudioBot/1.0"}
         async with session.get(url, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
@@ -964,7 +1120,7 @@ async def fetch_dark_map_image(session: aiohttp.ClientSession, lat: float, lon: 
 
     async def get_tile(dx, dy):
         tx, ty = cx + dx, cy + dy
-        url = f"[https://a.basemaps.cartocdn.com/dark_all/](https://a.basemaps.cartocdn.com/dark_all/){zoom}/{tx}/{ty}.png"
+        url = f"https://a.basemaps.cartocdn.com/dark_all/{zoom}/{tx}/{ty}.png"
         try:
             async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=8)) as r:
                 if r.status == 200:
@@ -996,8 +1152,9 @@ def build_map_zoom_reel_sync(map_img: Image.Image, photo_path: str, loc_name: st
 
     f_loc = load_font("display", 54)
     loc_txt = f"موقعیت: {loc_name}"
-    lb = hd.textbbox((0, 0), fa_shape(loc_txt), font=f_loc)
-    lw = (lb[2] - lb[0]) + 80
+    l_draw, l_kw = prepare_text_and_kwargs(loc_txt, is_rtl=True)
+    lb = hd.textbbox((0, 0), l_draw, font=f_loc, **l_kw)
+    lw = min(w - 100, (lb[2] - lb[0]) + 84)
     hd.rounded_rectangle([(cx - lw // 2, cy + 90), (cx + lw // 2, cy + 178)], radius=14, fill=(220, 38, 38, 240), outline=(255, 255, 255, 220), width=3)
     draw_rtl_text(hd, (cx, cy + 104), loc_txt, f_loc, (255, 255, 255, 255), align="center", shadow=False)
 
@@ -1012,41 +1169,39 @@ def build_map_zoom_reel_sync(map_img: Image.Image, photo_path: str, loc_name: st
 
     clip1 = os.path.join(work_dir, "c1.mp4")
     clip2 = os.path.join(work_dir, "c2.mp4")
+    wav_path = generate_news_audio_wav(os.path.join(work_dir, "map_sfx.wav"), 12.0, mode="news")
     out_mp4 = os.path.join(TMP_ROOT, f"map_reel_{int(time.time()*1000)}.mp4")
 
-    subprocess.run([
+    run_ffmpeg([
         "ffmpeg", "-y", "-i", map_bg_path, "-loop", "1", "-t", "4.5", "-i", hud_path,
         "-filter_complex",
-        "[0:v]zoompan=z='min(1.0+0.0045*on,1.50)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=113:s=1080x1920:fps=25,format=rgba[m];"
-        "[m][1:v]overlay=0:0,format=yuv420p[v]",
+        "[0:v]zoompan=z='1+0.0042*on':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=113:s=1080x1920:fps=25,format=rgba[m];"
+        "[m][1:v]overlay=0:0,format=yuv420p,setsar=1[v]",
         "-map", "[v]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-t", "4.5", clip1
-    ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    ])
 
-    subprocess.run([
+    run_ffmpeg([
         "ffmpeg", "-y", "-i", news_bg_path,
-        "-vf", "zoompan=z='min(1.0+0.0005*on,1.10)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=200:s=1080x1920:fps=25,format=yuv420p",
+        "-vf", "zoompan=z='1+0.0005*on':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=200:s=1080x1920:fps=25,format=yuv420p,setsar=1",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-t", "8", clip2
-    ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    ])
 
     repo_frame = find_repo_reel_frame() if CONFIG["use_repo_frame"] else ""
-    cmd = [
-        "ffmpeg", "-y", "-i", clip1, "-i", clip2,
-        "-f", "lavfi", "-t", "12",
-        "-i", "aevalsrc=0.10*sin(2*PI*110*t)*(0.5+0.5*sin(2*PI*1.5*t))+0.03*sin(2*PI*330*t)*gt(mod(t,1.2),1.05):s=44100",
-    ]
+    cmd = ["ffmpeg", "-y", "-i", clip1, "-i", clip2, "-i", wav_path]
+    base_xf = "[0:v]fps=25,format=yuv420p,settb=AVTB[v0];[1:v]fps=25,format=yuv420p,settb=AVTB[v1];[v0][v1]xfade=transition=fade:duration=0.5:offset=4.0"
     if repo_frame:
         fr_p = prepare_rgba_frame_1080x1920(repo_frame, work_dir)
         cmd += ["-loop", "1", "-t", "12", "-i", fr_p]
-        fcomp = "[0:v][1:v]xfade=transition=fade:duration=0.5:offset=4.0,format=rgba[xf];[xf][3:v]overlay=0:0,format=yuv420p[v]"
+        fcomp = f"{base_xf},format=rgba[xf];[xf][3:v]overlay=0:0,format=yuv420p[v]"
     else:
-        fcomp = "[0:v][1:v]xfade=transition=fade:duration=0.5:offset=4.0,format=yuv420p[v]"
+        fcomp = f"{base_xf},format=yuv420p[v]"
 
     cmd += [
         "-filter_complex", fcomp, "-map", "[v]", "-map", "2:a",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
         "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", "-t", "12", out_mp4
     ]
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    run_ffmpeg(cmd)
     shutil.rmtree(work_dir, ignore_errors=True)
     return out_mp4
 
@@ -1069,26 +1224,26 @@ def build_daily_summary_reel_sync(items: list) -> str:
     draw_rtl_text(idraw, (w // 2, 720), "۶۰ ثانیه با اخبار شیراز", load_font("display", 94), theme["text"], align="center")
     draw_rtl_text(idraw, (w // 2, 880), date_str, load_font("bold", 42), theme["subtext"], align="center")
     draw_rtl_text(idraw, (w // 2, 1080), f"{to_persian_digits(str(len(items)))} تیتر برگزیده امروز", load_font("bold", 40), theme["accent"], align="center")
-    draw_rtl_text(idraw, (w // 2, 1680), BRAND_HANDLE, load_font("bold", 42), theme["text"], align="center")
+    draw_rtl_text(idraw, (w // 2, 1680), BRAND_HANDLE, load_font("bold", 42), theme["text"], align="center", is_rtl=False)
     intro_img = os.path.join(work_dir, "intro.jpg")
     intro.save(intro_img, quality=92)
     intro_mp4 = os.path.join(work_dir, "s_00.mp4")
-    subprocess.run([
+    run_ffmpeg([
         "ffmpeg", "-y", "-i", intro_img,
-        "-vf", "zoompan=z='min(1.0+0.001*on,1.06)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=63:s=1080x1920:fps=25,format=yuv420p",
+        "-vf", "zoompan=z='1+0.0009*on':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=63:s=1080x1920:fps=25,format=yuv420p,setsar=1",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-t", "2.5", intro_mp4
-    ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    ])
     clips.append(intro_mp4)
 
     for idx, item in enumerate(items[:6], start=1):
         badge = f"خبر {to_persian_digits(str(idx))} از {to_persian_digits(str(len(items[:6])))}  |  {item.get('tag', 'شیراز')}"
         card_p = render_news_card_sync(item.get("photo"), badge, item["headline"], f"ثبت‌شده در ساعت {to_persian_digits(item.get('time', ''))}", fmt="story", theme_key=CONFIG["theme"])
         c_mp4 = os.path.join(work_dir, f"s_{idx:02d}.mp4")
-        subprocess.run([
+        run_ffmpeg([
             "ffmpeg", "-y", "-i", card_p,
-            "-vf", "zoompan=z='min(1.0+0.0006*on,1.08)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=138:s=1080x1920:fps=25,format=yuv420p",
+            "-vf", "zoompan=z='1+0.00055*on':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=138:s=1080x1920:fps=25,format=yuv420p,setsar=1",
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-t", "5.5", c_mp4
-        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        ])
         clips.append(c_mp4)
 
     clips.append(build_endscreen_clip_sync(work_dir, duration=2.5))
@@ -1099,14 +1254,11 @@ def build_daily_summary_reel_sync(items: list) -> str:
             f.write(f"file '{c}'\n")
 
     total_sec = 2.5 + len(items[:6]) * 5.5 + 2.5
+    wav_path = generate_news_audio_wav(os.path.join(work_dir, "daily_sfx.wav"), total_sec, mode="news")
     out_mp4 = os.path.join(TMP_ROOT, f"daily60_{int(time.time()*1000)}.mp4")
     repo_frame = find_repo_reel_frame() if CONFIG["use_repo_frame"] else ""
 
-    cmd = [
-        "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_file,
-        "-f", "lavfi", "-t", str(total_sec),
-        "-i", "aevalsrc=0.09*sin(2*PI*130*t)*(0.5+0.5*sin(2*PI*2*t))+0.03*sin(2*PI*260*t)*gt(mod(t,1),0.8):s=44100",
-    ]
+    cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_file, "-i", wav_path]
     if repo_frame:
         fr_p = prepare_rgba_frame_1080x1920(repo_frame, work_dir)
         cmd += ["-loop", "1", "-t", str(total_sec), "-i", fr_p,
@@ -1119,7 +1271,7 @@ def build_daily_summary_reel_sync(items: list) -> str:
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
         "-c:a", "aac", "-b:a", "128k", "-shortest", "-movflags", "+faststart", out_mp4
     ]
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    run_ffmpeg(cmd)
     shutil.rmtree(work_dir, ignore_errors=True)
     return out_mp4
 
@@ -1159,7 +1311,7 @@ def build_audiogram_reel_sync(audio_path: str, headline: str, speaker_photo: str
         ty += 94
 
     draw.rounded_rectangle([(60, 1210), (w - 60, 1490)], radius=24, fill=(0, 0, 0, 100), outline=theme["accent"] + (160,), width=3)
-    draw_rtl_text(draw, (w // 2, 1630), f"شنونده گزارش‌های لحظه‌ای در {BRAND_HANDLE}", load_font("bold", 34), theme["subtext"] + (240,), align="center")
+    draw_rtl_text(draw, (w // 2, 1630), BRAND_HANDLE, load_font("bold", 38), theme["accent"] + (255,), align="center", is_rtl=False)
 
     bg_path = os.path.join(work_dir, "audio_bg.png")
     bg.convert("RGB").save(bg_path)
@@ -1188,12 +1340,12 @@ def build_audiogram_reel_sync(audio_path: str, headline: str, speaker_photo: str
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
         "-c:a", "aac", "-b:a", "128k", "-shortest", "-movflags", "+faststart", out_mp4
     ]
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    run_ffmpeg(cmd)
     shutil.rmtree(work_dir, ignore_errors=True)
     return out_mp4
 
 
-# ==================== ۶. استودیو تدوین ویدئو (اصالت + ردیابی چهره + قاب ریلز مخزن + اند-اسکرین) ====================
+# ==================== ۶. استودیو تدوین ویدئو (اصالت + چهره + قاب ریلز + اند-اسکرین) ====================
 def probe_video_info(video_path: str) -> dict:
     cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", "-show_format", video_path]
     res = subprocess.run(cmd, capture_output=True, text=True)
@@ -1245,7 +1397,7 @@ def build_lower_third_png(work_dir: str) -> str:
     d.rounded_rectangle([(560, 1560), (1035, 1665)], radius=16, fill=theme["bg"] + (225,), outline=theme["accent"] + (255,), width=3)
     d.rectangle([(1018, 1574), (1028, 1651)], fill=theme["accent"] + (255,))
     draw_rtl_text(d, (1000, 1574), BRAND_TITLE_FA, load_font("bold", 30), theme["text"] + (255,), align="right", shadow=False)
-    d.text((585, 1618), BRAND_HANDLE, font=load_font("bold", 26), fill=theme["accent"] + (255,))
+    draw_rtl_text(d, (585, 1618), BRAND_HANDLE, load_font("bold", 26), theme["accent"] + (255,), align="left", shadow=False, is_rtl=False)
     p = os.path.join(work_dir, "lower_third.png")
     ov.save(p)
     return p
@@ -1260,7 +1412,7 @@ def build_endscreen_clip_sync(work_dir: str, duration: float = 2.2, with_silent_
     draw_rtl_text(d, (540, 740), BRAND_TITLE_FA, load_font("display", 84), theme["text"], align="center")
     draw_rtl_text(d, (540, 880), "برای پیگیری لحظه‌ای اخبار شیراز و فارس فالو کنید", load_font("bold", 38), theme["subtext"], align="center")
     d.rounded_rectangle([(260, 990), (820, 1100)], radius=20, fill=theme["accent"])
-    draw_rtl_text(d, (540, 1018), BRAND_HANDLE, load_font("bold", 48), (15, 23, 42), align="center", shadow=False)
+    draw_rtl_text(d, (540, 1018), BRAND_HANDLE, load_font("bold", 48), (15, 23, 42), align="center", shadow=False, is_rtl=False)
 
     img_p = os.path.join(work_dir, "endscreen.jpg")
     im.save(img_p, quality=92)
@@ -1276,7 +1428,7 @@ def build_endscreen_clip_sync(work_dir: str, duration: float = 2.2, with_silent_
     if with_silent_audio:
         cmd += ["-c:a", "aac", "-ar", "44100", "-ac", "2", "-b:a", "128k"]
     cmd += ["-t", str(duration), mp4_p]
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    run_ffmpeg(cmd)
     return mp4_p
 
 
@@ -1292,7 +1444,6 @@ def process_video_studio_sync(video_path: str) -> tuple:
     use_brand = CONFIG["video_brand"]
     repo_frame = find_repo_reel_frame() if CONFIG["use_repo_frame"] else ""
 
-    # ۱. کادربندی ۹:۱۶ (ردیابی چهره در ویدئوی افقی یا پس‌زمینه تار سینمایی)
     if use_facetrack and w > h:
         face_x = detect_face_center_x(video_path)
         if face_x >= 0:
@@ -1316,14 +1467,12 @@ def process_video_studio_sync(video_path: str) -> tuple:
             "[b][f]overlay=(W-w)/2:(H-h)/2"
         )
 
-    # ۲. اصالت‌سازی و حذف کامل متادیتا
     if use_antidup:
         v_chain += ",scale=1112:1978,crop=1080:1920,eq=contrast=1.02:saturation=1.03:brightness=0.008,setpts=PTS/1.015"
         applied.append("اصالت‌سازی و حذف متادیتا ✅")
 
     v_chain += ",fps=25,setsar=1"
 
-    # ۳. اعمال قاب ریلز اختصاصی مخزن (یا نوار Lower-Third در صورت نبود فایل)
     inputs = ["-i", video_path]
     if repo_frame:
         fr_p = prepare_rgba_frame_1080x1920(repo_frame, work_dir)
@@ -1333,7 +1482,7 @@ def process_video_studio_sync(video_path: str) -> tuple:
     elif use_brand:
         lt_png = build_lower_third_png(work_dir)
         inputs += ["-loop", "1", "-i", lt_png]
-        v_chain += ",format=rgba[mainv];[mainv][1:v]overlay=0:0:shortest=1:enable='gte(t,1.2)',format=yuv420p[vout]"
+        v_chain += ",format=rgba[mainv];[mainv][1:v]overlay=0:0:shortest=1:enable='floor(t)',format=yuv420p[vout]"
         applied.append("نوار برند Lower-Third ✅")
     else:
         v_chain += ",format=yuv420p[vout]"
@@ -1349,14 +1498,14 @@ def process_video_studio_sync(video_path: str) -> tuple:
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
         "-movflags", "+faststart", main_processed
     ]
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    run_ffmpeg(cmd)
 
     out_mp4 = os.path.join(TMP_ROOT, f"studio_vid_{int(time.time()*1000)}.mp4")
     if use_brand:
         end_clip = build_endscreen_clip_sync(work_dir, duration=2.2, with_silent_audio=has_audio)
         applied.append("اند-اسکرین دعوت به فالو (۲.۲ ثانیه) ✅")
         if has_audio:
-            subprocess.run([
+            run_ffmpeg([
                 "ffmpeg", "-y", "-i", main_processed, "-i", end_clip,
                 "-filter_complex", "[0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1[v][a]",
                 "-map", "[v]", "-map", "[a]",
@@ -1364,16 +1513,16 @@ def process_video_studio_sync(video_path: str) -> tuple:
                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
                 "-c:a", "aac", "-ar", "44100", "-ac", "2", "-b:a", "128k",
                 "-movflags", "+faststart", out_mp4
-            ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            ])
         else:
-            subprocess.run([
+            run_ffmpeg([
                 "ffmpeg", "-y", "-i", main_processed, "-i", end_clip,
                 "-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0[v]",
                 "-map", "[v]",
                 "-map_metadata", "-1",
                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
                 "-movflags", "+faststart", out_mp4
-            ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            ])
     else:
         shutil.copy(main_processed, out_mp4)
 
@@ -1417,7 +1566,7 @@ async def build_daily_occasion_card(session: aiohttp.ClientSession) -> tuple:
         cx, cy = w // 2, 740
         d.ellipse([(cx - 210, cy - 210), (cx + 210, cy + 210)], fill=theme["accent"])
         draw_rtl_text(d, (cx, cy - 115), day_str, load_font("display", 210), theme["bg"], align="center", shadow=False)
-        draw_rtl_text(d, (w // 2, 1020), f"{wd} | {month_str} {year_str}", load_font("display", 72), theme["text"], align="center")
+        draw_rtl_text(d, (w // 2, 1020), f"{wd}  |  {month_str} {year_str}", load_font("display", 72), theme["text"], align="center")
 
         d.line([(200, 1150), (w - 200, 1150)], fill=theme["accent"], width=4)
         f_occ = load_font("bold", 46)
@@ -1427,7 +1576,7 @@ async def build_daily_occasion_card(session: aiohttp.ClientSession) -> tuple:
             draw_rtl_text(d, (w // 2, oy), ln, f_occ, theme["subtext"], align="center")
             oy += 72
 
-        draw_rtl_text(d, (w // 2, 1620), BRAND_HANDLE, load_font("bold", 42), theme["accent"], align="center")
+        draw_rtl_text(d, (w // 2, 1620), BRAND_HANDLE, load_font("bold", 42), theme["accent"], align="center", is_rtl=False)
         out = os.path.join(TMP_ROOT, f"occasion_{int(time.time()*1000)}.jpg")
         im.save(out, quality=94)
         return out
@@ -1435,275 +1584,20 @@ async def build_daily_occasion_card(session: aiohttp.ClientSession) -> tuple:
     card_path = await asyncio.to_thread(draw_card)
     caption = f"📅 {full_date}\n\n{occasion}\n\n🔔 {BRAND_HANDLE}"
     return card_path, caption
-
-
-# ==================== منوهای شیشه‌ای ====================
-def build_main_menu() -> tuple:
-    now_str = to_persian_digits(get_tehran_now().strftime("%H:%M"))
-    t_name = THEMES[CONFIG["theme"]]["name"]
-    ai_status = "متصل ✅" if GEMINI_API_KEY else "کلید GEMINI_API_KEY ثبت نشده ⚠️"
-
-    repo_fr = find_repo_reel_frame()
-    if repo_fr:
-        fr_status = f"فعال ✅ ({os.path.basename(repo_fr)})" if CONFIG["use_repo_frame"] else f"موجود ولی خاموش ⏸ ({os.path.basename(repo_fr)})"
-    else:
-        fr_status = "آپلود نشده (نام فایل: reel_frame.png)"
-
-    text = (
-        f"🎬 استودیوی تولید محتوای {BRAND_HANDLE}\n\n"
-        f"🕒 ساعت تهران: {now_str}\n"
-        f"🎨 تم فعال: {t_name}\n"
-        f"🖼️ قاب ریلز مخزن: {fr_status}\n"
-        f"🧠 هوش مصنوعی سردبیری: {ai_status}\n"
-        f"📦 صف جمع‌بندی ۶۰ ثانیه‌ای امروز: {to_persian_digits(str(len(DAILY_ITEMS)))} خبر\n\n"
-        "یکی از ابزارهای زیر را انتخاب کنید:"
-    )
-
-    kb = {
-        "inline_keyboard": [
-            [
-                {"text": "🖼️ کارت پست (۴:۵)", "callback_data": "m_card_post"},
-                {"text": "📱 کارت استوری (۹:۱۶)", "callback_data": "m_card_story"},
-            ],
-            [{"text": "🚨 ریلز فوری و حادثه‌ای (قالب اضطراری)", "callback_data": "m_incident"}],
-            [{"text": "✍️ کپشن‌نویس فعال (متن / عکس / فیلم)", "callback_data": "m_caption"}],
-            [
-                {"text": "🗺️ ریلز زوم نقشه", "callback_data": "m_map"},
-                {"text": "🎙️ ریلز موج صوتی", "callback_data": "m_audio"},
-            ],
-            [{"text": f"🎬 ریلز جمع‌بندی ۶۰ ثانیه‌ای ({len(DAILY_ITEMS)} خبر)", "callback_data": "m_daily60"}],
-            [{"text": "🎞️ استودیو تدوین ویدئو (قاب+اصالت+چهره)", "callback_data": "m_video"}],
-            [
-                {"text": "🛡️ سپر ضدشدوبن", "callback_data": "m_shadowban"},
-                {"text": "🎨 تغییر تم گرافیکی", "callback_data": "m_theme"},
-            ],
-            [
-                {"text": "📅 کارت مناسبت امروز", "callback_data": "m_occasion"},
-                {"text": "🔄 بروزرسانی پنل", "callback_data": "main_menu"},
-            ],
-        ]
-    }
-    return text, kb
-
-
-def build_theme_menu() -> tuple:
-    cur = THEMES[CONFIG["theme"]]["name"]
-    text = (
-        f"🎨 تغییر آنی تم گرافیکی\n\nتم فعال فعلی: {cur}\n\n"
-        "ℹ️ ریلز «فوری و حادثه‌ای» همیشه قالب اضطراری و متمایز قرمز-مشکی خود را حفظ می‌کند."
-    )
-    rows = []
-    for k, v in THEMES.items():
-        mark = " ✅" if CONFIG["theme"] == k else ""
-        rows.append([{"text": f"{v['name']}{mark}", "callback_data": f"set_theme:{k}"}])
-    rows.append([{"text": "🔙 بازگشت به منوی اصلی", "callback_data": "main_menu"}])
-    return text, {"inline_keyboard": rows}
-
-
-def build_video_studio_menu() -> tuple:
-    def onoff(b):
-        return "روشن ✅" if b else "خاموش ❌"
-
-    repo_fr = find_repo_reel_frame()
-    fr_note = f"فایل شناسایی‌شده: {repo_fr}" if repo_fr else "فایل reel_frame.png هنوز در مخزن آپلود نشده است"
-
-    text = (
-        "🎞️ استودیو تدوین هوشمند ویدئو و ریلز\n\n"
-        "گزینه‌های دلخواه را تنظیم کنید و سپس **ویدئوی خود را (زیر ۲۰ مگابایت)** مستقیم همینجا بفرستید:\n\n"
-        f"• قاب ریلز اختصاصی مخزن: {onoff(CONFIG['use_repo_frame'])} ({fr_note})\n"
-        f"• اصالت‌سازی و حذف متادیتا (ضد تکراری): {onoff(CONFIG['video_antidup'])}\n"
-        f"• تبدیل افقی به عمودی ۹:۱۶ با ردیابی چهره: {onoff(CONFIG['video_facetrack'])}\n"
-        f"• اند-اسکرین ۲ ثانیه‌ای (و نوار برند): {onoff(CONFIG['video_brand'])}"
-    )
-    kb = {
-        "inline_keyboard": [
-            [{"text": f"🖼️ قاب ریلز مخزن (reel_frame.png): {onoff(CONFIG['use_repo_frame'])}", "callback_data": "vtog_use_repo_frame"}],
-            [{"text": f"🧬 اصالت‌سازی و حذف متادیتا: {onoff(CONFIG['video_antidup'])}", "callback_data": "vtog_video_antidup"}],
-            [{"text": f"👤 ردیابی چهره ۹:۱۶: {onoff(CONFIG['video_facetrack'])}", "callback_data": "vtog_video_facetrack"}],
-            [{"text": f"🏷️ اند-اسکرین دعوت به فالو: {onoff(CONFIG['video_brand'])}", "callback_data": "vtog_video_brand"}],
-            [{"text": "🔙 بازگشت به منوی اصلی", "callback_data": "main_menu"}],
-        ]
-    }
-    return text, kb
-
-
-def build_cancel_kb() -> dict:
-    return {"inline_keyboard": [[{"text": "❌ انصراف و بازگشت به منو", "callback_data": "main_menu"}]]}
-
-
+    # ==================== ارسال کپشن + سپر ضدشدوبن ====================
 async def send_caption_with_shield(session: aiohttp.ClientSession, chat_id: str, caption: str):
     LAST_CAPTION[chat_id] = caption
-    await send_message(session, chat_id, caption)
-
     if CONFIG["auto_shadowban"]:
         hits = check_shadowban_words(caption)
         if hits:
+            await send_message(session, chat_id, caption)
             lines = ["🛡️ هشدار سپر ضدشدوبن — کلمات حساس شناسایی‌شده در کپشن:"]
             for w, alt in hits[:6]:
                 lines.append(f"• «{w}» ← پیشنهاد ایمن: {alt}")
-            kb = {
-                "inline_keyboard": [
-                    [{"text": "✨ بازنویسی خودکار و ایمن کپشن", "callback_data": "do_safe_rewrite"}],
-                    [{"text": "🔙 منوی اصلی", "callback_data": "main_menu"}],
-                ]
-            }
-            await send_message(session, chat_id, "\n".join(lines), kb)
-
-
-# ==================== مدیریت کلیک دکمه‌های شیشه‌ای ====================
-async def handle_callback(session: aiohttp.ClientSession, cb: dict):
-    cb_id = cb["id"]
-    from_id = str(cb["from"]["id"])
-    msg = cb.get("message", {})
-    chat_id = str(msg.get("chat", {}).get("id", ""))
-    message_id = msg.get("message_id")
-    data = cb.get("data", "")
-
-    if not is_admin(from_id):
-        await answer_callback(session, cb_id, "⛔ دسترسی مجاز نیست.", show_alert=True)
-        return
-
-    if data == "main_menu":
-        USER_STATE.pop(chat_id, None)
-        txt, kb = build_main_menu()
-        await edit_message(session, chat_id, message_id, txt, kb)
-        await answer_callback(session, cb_id)
-
-    elif data in ("m_card_post", "m_card_story"):
-        fmt = "post" if data == "m_card_post" else "story"
-        fmt_fa = "پست (۴:۵)" if fmt == "post" else "استوری (۹:۱۶)"
-        USER_STATE[chat_id] = {"mode": "card", "step": "wait_input", "fmt": fmt}
-        await edit_message(
-            session, chat_id, message_id,
-            f"🖼️ ساخت کارت {fmt_fa}\n\n"
-            "عکس خبر را همراه با متن خبر (در کپشن عکس) بفرستید؛\n"
-            "یا فقط متن بفرستید تا روی پس‌زمینه رسمی برند طراحی شود:",
-            build_cancel_kb(),
-        )
-        await answer_callback(session, cb_id)
-
-    elif data == "m_incident":
-        USER_STATE[chat_id] = {"mode": "incident", "step": "wait_input"}
-        await edit_message(
-            session, chat_id, message_id,
-            "🚨 ساخت ریلز فوری و حادثه‌ای (قالب اضطراری قرمز-مشکی + نور آژیر)\n\n"
-            "عکس حادثه را همراه با متن خبر بفرستید تا ریلز ۱۴ ثانیه‌ای حادثه‌ای و کپشن ۶ بخشی فوری برایتان بسازم:",
-            build_cancel_kb(),
-        )
-        await answer_callback(session, cb_id)
-
-    elif data == "m_caption":
-        USER_STATE[chat_id] = {"mode": "caption_active", "step": "wait_input"}
-        await edit_message(
-            session, chat_id, message_id,
-            f"✍️ کپشن‌نویس فعال ({BRAND_HANDLE})\n\n"
-            "برای چه چیزی کپشن می‌خواهید؟ یکی از موارد زیر را مستقیم بفرستید:\n"
-            "• 🎥 یک فیلم / ویدئو (تا ۲۰ مگابایت)\n"
-            "• 🖼️ یک عکس (با یا بدون توضیح)\n"
-            "• 🎙️ یک ویس یا فایل صوتی\n"
-            "• 📝 متن خبر و نام منبع\n\n"
-            "بلافاصله کپشن دقیق ۶ بخشی + بررسی ضدشدوبن تحویل می‌دهم:",
-            build_cancel_kb(),
-        )
-        await answer_callback(session, cb_id)
-
-    elif data == "m_map":
-        USER_STATE[chat_id] = {"mode": "map_reel", "step": "wait_location", "data": {}}
-        await edit_message(
-            session, chat_id, message_id,
-            "🗺️ ریلز زوم سینمایی روی نقشه\n\n"
-            "مرحله ۱ از ۲: نام محله در شیراز یا شهر استان فارس را بنویسید\n"
-            "(مثلاً: معالی‌آباد، صدرا، بلوار چمران، مرودشت، جهرم، کازرون...):",
-            build_cancel_kb(),
-        )
-        await answer_callback(session, cb_id)
-
-    elif data == "m_audio":
-        USER_STATE[chat_id] = {"mode": "audiogram", "step": "wait_audio", "data": {}}
-        await edit_message(
-            session, chat_id, message_id,
-            "🎙️ ریلز موج صوتی (Audiogram)\n\n"
-            "مرحله ۱ از ۲: ویس (Voice) یا فایل صوتی مصاحبه/گزارش را بفرستید:",
-            build_cancel_kb(),
-        )
-        await answer_callback(session, cb_id)
-
-    elif data == "m_daily60":
-        if not DAILY_ITEMS:
-            await answer_callback(
-                session, cb_id,
-                "هنوز خبری در صف امروز ثبت نشده! هر کارت، ریلز یا کپشنی بسازید خودکار اینجا اضافه می‌شود.",
-                show_alert=True,
-            )
+            lines.append("\nبرای اصلاح خودکار، دکمه «✨ بازنویسی ایمن آخرین کپشن» را از منوی پایین صفحه بزنید.")
+            await send_message(session, chat_id, "\n".join(lines), kb_shadowban_actions())
             return
-        await answer_callback(session, cb_id, "🎬 ساخت ریلز جمع‌بندی شروع شد...")
-        await edit_message(session, chat_id, message_id, f"⏳ در حال تدوین ریلز جمع‌بندی از {len(DAILY_ITEMS[:6])} خبر امروز...")
-        spawn_bg_task(run_daily60_job(session, chat_id))
-
-    elif data == "m_video":
-        USER_STATE[chat_id] = {"mode": "video_studio", "step": "wait_video"}
-        txt, kb = build_video_studio_menu()
-        await edit_message(session, chat_id, message_id, txt, kb)
-        await answer_callback(session, cb_id)
-
-    elif data.startswith("vtog_"):
-        key = data[5:]
-        if key in CONFIG:
-            CONFIG[key] = not CONFIG[key]
-            await save_config_to_pin(session)
-        txt, kb = build_video_studio_menu()
-        await edit_message(session, chat_id, message_id, txt, kb)
-        await answer_callback(session, cb_id, "ذخیره شد ✅")
-
-    elif data == "m_shadowban":
-        USER_STATE[chat_id] = {"mode": "shadowban_check", "step": "wait_text"}
-        await edit_message(
-            session, chat_id, message_id,
-            "🛡️ سپر ضدشدوبن اینستاگرام\n\n"
-            "متن کپشن یا تیتر موردنظرتان را بفرستید تا کلمات حساس و محدودیت‌زا را شناسایی و نسخه ایمن آن را آماده کنم:",
-            build_cancel_kb(),
-        )
-        await answer_callback(session, cb_id)
-
-    elif data == "do_safe_rewrite":
-        orig = LAST_CAPTION.get(chat_id)
-        if not orig:
-            await answer_callback(session, cb_id, "کپشنی در حافظه نیست.", show_alert=True)
-            return
-        await answer_callback(session, cb_id, "⏳ در حال بازنویسی ایمن...")
-        safe = await rewrite_shadowban_safe(session, orig)
-        LAST_CAPTION[chat_id] = safe
-        await send_message(session, chat_id, "✅ نسخه ایمن و ضدشدوبن (آماده کپی):")
-        await send_message(session, chat_id, safe)
-
-    elif data == "m_theme":
-        txt, kb = build_theme_menu()
-        await edit_message(session, chat_id, message_id, txt, kb)
-        await answer_callback(session, cb_id)
-
-    elif data.startswith("set_theme:"):
-        tk = data.split(":", 1)[1]
-        if tk in THEMES:
-            CONFIG["theme"] = tk
-            await save_config_to_pin(session)
-        txt, kb = build_theme_menu()
-        await edit_message(session, chat_id, message_id, txt, kb)
-        await answer_callback(session, cb_id, f"تم به {THEMES[tk]['name']} تغییر کرد ✅")
-
-    elif data == "m_occasion":
-        await answer_callback(session, cb_id, "📅 در حال طراحی کارت مناسبت امروز...")
-        await edit_message(session, chat_id, message_id, "⏳ در حال آماده‌سازی کارت مناسبت روز...")
-        card_p, cap = await build_daily_occasion_card(session)
-        await send_photo_file(session, chat_id, card_p, caption=cap)
-        txt, kb = build_main_menu()
-        await send_message(session, chat_id, txt, kb)
-
-    elif data == "audio_skip_photo":
-        st = USER_STATE.get(chat_id)
-        if st and st.get("mode") == "audiogram":
-            st["step"] = "wait_title"
-            await edit_message(session, chat_id, message_id, "✏️ تیتر کوتاه برای روی ریلز صوتی را بفرستید:", build_cancel_kb())
-        await answer_callback(session, cb_id)
+    await send_message(session, chat_id, caption, kb_main_menu())
 
 
 # ==================== اجرای کارهای ویدئویی در پس‌زمینه ====================
@@ -1718,9 +1612,7 @@ async def run_daily60_job(session: aiohttp.ClientSession, chat_id: str):
         if os.path.exists(mp4):
             os.remove(mp4)
     except Exception as e:
-        await send_message(session, chat_id, f"⚠️ خطا در ساخت ریلز جمع‌بندی: {e}")
-    txt, kb = build_main_menu()
-    await send_message(session, chat_id, txt, kb)
+        await send_message(session, chat_id, f"⚠️ خطا در ساخت ریلز جمع‌بندی:\n{e}", kb_main_menu())
 
 
 async def run_incident_job(session: aiohttp.ClientSession, chat_id: str, photo_path: str, news_text: str):
@@ -1729,16 +1621,18 @@ async def run_incident_job(session: aiohttp.ClientSession, chat_id: str, photo_p
         mp4 = await asyncio.to_thread(build_incident_reel_sync, photo_path, hl)
         await send_video_file(session, chat_id, mp4, caption="🚨 ریلز فوری و حادثه‌ای آماده انتشار است.")
         cap = await generate_editorial_caption(
-            session, news_text=news_text, media_path=photo_path or None, mime_type="image/jpeg" if photo_path else None, force_incident=True
+            session,
+            news_text=news_text,
+            media_path=photo_path or None,
+            mime_type="image/jpeg" if photo_path else None,
+            force_incident=True,
         )
         await send_caption_with_shield(session, chat_id, cap)
         add_to_daily_items(hl, photo_path, tag="فوری")
         if os.path.exists(mp4):
             os.remove(mp4)
     except Exception as e:
-        await send_message(session, chat_id, f"⚠️ خطا در تولید ریلز حادثه‌ای: {e}")
-    txt, kb = build_main_menu()
-    await send_message(session, chat_id, txt, kb)
+        await send_message(session, chat_id, f"⚠️ خطا در تولید ریلز حادثه‌ای:\n{e}", kb_main_menu())
 
 
 async def run_map_job(session: aiohttp.ClientSession, chat_id: str, loc_name: str, photo_path: str, news_text: str):
@@ -1749,16 +1643,17 @@ async def run_map_job(session: aiohttp.ClientSession, chat_id: str, loc_name: st
         mp4 = await asyncio.to_thread(build_map_zoom_reel_sync, map_img, photo_path, loc_name, hl)
         await send_video_file(session, chat_id, mp4, caption=f"🗺️ ریلز زوم نقشه ({loc_name}) آماده است.")
         cap = await generate_editorial_caption(
-            session, news_text=f"موقعیت خبر: {loc_name}\n{news_text}", media_path=photo_path or None, mime_type="image/jpeg" if photo_path else None
+            session,
+            news_text=f"موقعیت خبر: {loc_name}\n{news_text}",
+            media_path=photo_path or None,
+            mime_type="image/jpeg" if photo_path else None,
         )
         await send_caption_with_shield(session, chat_id, cap)
         add_to_daily_items(hl, photo_path, tag=loc_name)
         if os.path.exists(mp4):
             os.remove(mp4)
     except Exception as e:
-        await send_message(session, chat_id, f"⚠️ خطا در ساخت ریلز نقشه: {e}")
-    txt, kb = build_main_menu()
-    await send_message(session, chat_id, txt, kb)
+        await send_message(session, chat_id, f"⚠️ خطا در ساخت ریلز نقشه:\n{e}", kb_main_menu())
 
 
 async def run_audiogram_job(session: aiohttp.ClientSession, chat_id: str, audio_path: str, speaker_photo: str, headline: str):
@@ -1766,16 +1661,17 @@ async def run_audiogram_job(session: aiohttp.ClientSession, chat_id: str, audio_
         mp4 = await asyncio.to_thread(build_audiogram_reel_sync, audio_path, headline, speaker_photo)
         await send_video_file(session, chat_id, mp4, caption="🎙️ ریلز موج صوتی آماده است.")
         cap = await generate_editorial_caption(
-            session, news_text=f"تیتر گزارش صوتی: {headline}", media_path=audio_path, mime_type="audio/ogg"
+            session,
+            news_text=f"تیتر گزارش صوتی: {headline}",
+            media_path=audio_path,
+            mime_type="audio/ogg",
         )
         await send_caption_with_shield(session, chat_id, cap)
         add_to_daily_items(headline, speaker_photo, tag="صوتی")
         if os.path.exists(mp4):
             os.remove(mp4)
     except Exception as e:
-        await send_message(session, chat_id, f"⚠️ خطا در ساخت ریلز صوتی: {e}")
-    txt, kb = build_main_menu()
-    await send_message(session, chat_id, txt, kb)
+        await send_message(session, chat_id, f"⚠️ خطا در ساخت ریلز صوتی:\n{e}", kb_main_menu())
 
 
 async def run_video_studio_job(session: aiohttp.ClientSession, chat_id: str, vid_path: str, user_caption: str):
@@ -1788,12 +1684,10 @@ async def run_video_studio_job(session: aiohttp.ClientSession, chat_id: str, vid
         if os.path.exists(out_mp4):
             os.remove(out_mp4)
     except Exception as e:
-        await send_message(session, chat_id, f"⚠️ خطا در پردازش ویدئو: {e}")
-    txt, kb = build_main_menu()
-    await send_message(session, chat_id, txt, kb)
+        await send_message(session, chat_id, f"⚠️ خطا در پردازش ویدئو:\n{e}", kb_main_menu())
 
 
-# ==================== مدیریت پیام‌های ورودی ====================
+# ==================== مدیریت کامل دکمه‌های منوی پایین صفحه و پیام‌ها ====================
 async def handle_message(session: aiohttp.ClientSession, msg: dict):
     chat_id = str(msg["chat"]["id"])
     from_id = str(msg.get("from", {}).get("id", chat_id))
@@ -1806,16 +1700,170 @@ async def handle_message(session: aiohttp.ClientSession, msg: dict):
         return
 
     text = (msg.get("text") or msg.get("caption") or "").strip()
-    if text == "/start":
+    is_pure_text = bool(msg.get("text")) and not (msg.get("photo") or msg.get("video") or msg.get("voice") or msg.get("audio"))
+
+    # --- دکمه‌های عمومی شروع و بازگشت ---
+    if is_pure_text and text in ("/start", "/menu", BTN_BACK, BTN_CANCEL, BTN_STATUS):
         USER_STATE.pop(chat_id, None)
-        t, kb = build_main_menu()
-        await send_message(session, chat_id, t, kb)
+        await send_message(session, chat_id, build_status_text(), kb_main_menu())
         return
 
+    # --- بازنویسی ایمن آخرین کپشن ---
+    if is_pure_text and text == BTN_SAFE_REWRITE:
+        orig = LAST_CAPTION.get(chat_id)
+        if not orig:
+            await send_message(session, chat_id, "⚠️ کپشنی در حافظه نیست.", kb_main_menu())
+            return
+        await send_message(session, chat_id, "⏳ در حال بازنویسی ایمن و ضدشدوبن...")
+        safe = await rewrite_shadowban_safe(session, orig)
+        LAST_CAPTION[chat_id] = safe
+        await send_message(session, chat_id, "✅ نسخه ایمن و ضدشدوبن (آماده کپی):")
+        await send_message(session, chat_id, safe, kb_main_menu())
+        return
+
+    # --- دکمه‌های منوی اصلی پایین صفحه ---
+    if is_pure_text and text in (BTN_CARD_POST, BTN_CARD_STORY):
+        fmt = "post" if text == BTN_CARD_POST else "story"
+        fmt_fa = "پست (۴:۵)" if fmt == "post" else "استوری (۹:۱۶)"
+        USER_STATE[chat_id] = {"mode": "card", "step": "wait_input", "fmt": fmt}
+        await send_message(
+            session,
+            chat_id,
+            f"🖼️ ساخت کارت {fmt_fa}\n\nعکس خبر را همراه با متن خبر بفرستید (یا فقط متن بفرستید):",
+            kb_cancel(),
+        )
+        return
+
+    if is_pure_text and text == BTN_INCIDENT:
+        USER_STATE[chat_id] = {"mode": "incident", "step": "wait_input"}
+        await send_message(
+            session,
+            chat_id,
+            "🚨 ساخت ریلز فوری و حادثه‌ای (قالب اضطراری قرمز-مشکی + نور آژیر)\n\n"
+            "عکس حادثه را همراه با متن خبر بفرستید:",
+            kb_cancel(),
+        )
+        return
+
+    if is_pure_text and text == BTN_CAPTION:
+        USER_STATE[chat_id] = {"mode": "caption_active", "step": "wait_input"}
+        await send_message(
+            session,
+            chat_id,
+            f"✍️ کپشن‌نویس فعال ({BRAND_HANDLE})\n\n"
+            "برای چه چیزی کپشن می‌خواهید؟ یکی از موارد زیر را مستقیم بفرستید:\n"
+            "• 🎥 فیلم / ویدئو (تا ۲۰ مگابایت)\n"
+            "• 🖼️ عکس (با یا بدون توضیح)\n"
+            "• 🎙️ ویس یا فایل صوتی\n"
+            "• 📝 متن خبر و نام منبع",
+            kb_cancel(),
+        )
+        return
+
+    if is_pure_text and text == BTN_MAP:
+        USER_STATE[chat_id] = {"mode": "map_reel", "step": "wait_location", "data": {}}
+        await send_message(
+            session,
+            chat_id,
+            "🗺️ ریلز زوم سینمایی روی نقشه\n\n"
+            "مرحله ۱ از ۲: نام محله در شیراز یا شهر استان فارس را بنویسید (مثلاً: معالی‌آباد، صدرا، مرودشت):",
+            kb_cancel(),
+        )
+        return
+
+    if is_pure_text and text == BTN_AUDIO:
+        USER_STATE[chat_id] = {"mode": "audiogram", "step": "wait_audio", "data": {}}
+        await send_message(
+            session,
+            chat_id,
+            "🎙️ ریلز موج صوتی (Audiogram)\n\nمرحله ۱ از ۲: ویس یا فایل صوتی را بفرستید:",
+            kb_cancel(),
+        )
+        return
+
+    if is_pure_text and text == BTN_DAILY60:
+        if not DAILY_ITEMS:
+            await send_message(
+                session,
+                chat_id,
+                "⚠️ هنوز خبری در صف امروز ثبت نشده! هر کارت، ریلز یا کپشنی بسازید خودکار به این صف اضافه می‌شود.",
+                kb_main_menu(),
+            )
+            return
+        await send_message(session, chat_id, f"🎬 در حال تدوین ریلز جمع‌بندی از {len(DAILY_ITEMS[:6])} خبر امروز...", kb_main_menu())
+        spawn_bg_task(run_daily60_job(session, chat_id))
+        return
+
+    if is_pure_text and text == BTN_VIDEO:
+        USER_STATE[chat_id] = {"mode": "video_studio", "step": "wait_video"}
+        repo_fr = find_repo_reel_frame()
+        fr_note = f"فایل شناسایی‌شده: {os.path.basename(repo_fr)}" if repo_fr else "فایل reel_frame.png هنوز آپلود نشده"
+        await send_message(
+            session,
+            chat_id,
+            "🎞️ استودیو تدوین هوشمند ویدئو\n\n"
+            f"• قاب ریلز مخزن: {fr_note}\n"
+            "• گزینه‌ها را از منوی پایین روشن/خاموش کنید و سپس ویدئوی خود را (زیر ۲۰ مگابایت) مستقیم بفرستید:",
+            kb_video_studio(),
+        )
+        return
+
+    if is_pure_text and text == BTN_SHADOWBAN:
+        USER_STATE[chat_id] = {"mode": "shadowban_check", "step": "wait_text"}
+        await send_message(
+            session,
+            chat_id,
+            "🛡️ سپر ضدشدوبن اینستاگرام\n\nمتن کپشن یا تیتر خود را بفرستید تا کلمات حساس بررسی شوند:",
+            kb_cancel(),
+        )
+        return
+
+    if is_pure_text and text == BTN_THEME:
+        USER_STATE[chat_id] = {"mode": "theme_select"}
+        cur = THEMES[CONFIG["theme"]]["name"]
+        await send_message(
+            session,
+            chat_id,
+            f"🎨 تغییر آنی تم گرافیکی\n\nتم فعال فعلی: {cur}\nتم جدید را از منوی پایین صفحه انتخاب کنید:",
+            kb_theme_menu(),
+        )
+        return
+
+    if is_pure_text and text == BTN_OCCASION:
+        await send_message(session, chat_id, "📅 در حال طراحی کارت مناسبت امروز...")
+        card_p, cap = await build_daily_occasion_card(session)
+        await send_photo_file(session, chat_id, card_p, caption=cap, reply_markup=kb_main_menu())
+        return
+
+    # --- زیرمنوی انتخاب تم گرافیکی ---
+    if is_pure_text:
+        for tkey, tval in THEMES.items():
+            if text == tval["btn"]:
+                CONFIG["theme"] = tkey
+                await save_config_to_pin(session)
+                USER_STATE.pop(chat_id, None)
+                await send_message(session, chat_id, f"✅ تم گرافیکی به «{tval['name']}» تغییر کرد.", kb_main_menu())
+                return
+
+    # --- زیرمنوی تنظیمات استودیو ویدئو ---
+    if is_pure_text and text.startswith(("🖼️ قاب ریلز مخزن:", "🧬 اصالت‌سازی", "👤 ردیابی چهره", "🏷️ اند-اسکرین")):
+        if text.startswith("🖼️ قاب ریلز مخزن:"):
+            CONFIG["use_repo_frame"] = not CONFIG["use_repo_frame"]
+        elif text.startswith("🧬 اصالت‌سازی"):
+            CONFIG["video_antidup"] = not CONFIG["video_antidup"]
+        elif text.startswith("👤 ردیابی چهره"):
+            CONFIG["video_facetrack"] = not CONFIG["video_facetrack"]
+        elif text.startswith("🏷️ اند-اسکرین"):
+            CONFIG["video_brand"] = not CONFIG["video_brand"]
+        await save_config_to_pin(session)
+        USER_STATE[chat_id] = {"mode": "video_studio", "step": "wait_video"}
+        await send_message(session, chat_id, "✅ تنظیم ذخیره شد. حالا ویدئوی خود را بفرستید:", kb_video_studio())
+        return
+
+    # --- پردازش ورودی‌های کاربر در هر حالت ---
     state = USER_STATE.get(chat_id)
     if not state:
-        t, kb = build_main_menu()
-        await send_message(session, chat_id, t, kb)
+        await send_message(session, chat_id, build_status_text(), kb_main_menu())
         return
 
     mode = state.get("mode")
@@ -1827,7 +1875,7 @@ async def handle_message(session: aiohttp.ClientSession, msg: dict):
         if msg.get("photo"):
             photo_path = await download_tg_file(session, msg["photo"][-1]["file_id"], ".jpg")
         if not photo_path and not text:
-            await send_message(session, chat_id, "❌ لطفاً عکس یا متن خبر را بفرستید.")
+            await send_message(session, chat_id, "❌ لطفاً عکس یا متن خبر را بفرستید.", kb_main_menu())
             return
 
         await send_message(session, chat_id, "⏳ در حال طراحی کارت گرافیکی و نگارش کپشن ۶ بخشی...")
@@ -1835,12 +1883,13 @@ async def handle_message(session: aiohttp.ClientSession, msg: dict):
         card_p = await asyncio.to_thread(render_news_card_sync, photo_path, badge, hl, "", fmt, CONFIG["theme"])
         await send_photo_file(session, chat_id, card_p, caption="🖼️ کارت آماده انتشار")
         cap = await generate_editorial_caption(
-            session, news_text=text, media_path=photo_path or None, mime_type="image/jpeg" if photo_path else None
+            session,
+            news_text=text,
+            media_path=photo_path or None,
+            mime_type="image/jpeg" if photo_path else None,
         )
         await send_caption_with_shield(session, chat_id, cap)
         add_to_daily_items(hl, photo_path, tag=badge)
-        t, kb = build_main_menu()
-        await send_message(session, chat_id, t, kb)
         return
 
     if mode == "incident":
@@ -1849,9 +1898,9 @@ async def handle_message(session: aiohttp.ClientSession, msg: dict):
         if msg.get("photo"):
             photo_path = await download_tg_file(session, msg["photo"][-1]["file_id"], ".jpg")
         if not photo_path and not text:
-            await send_message(session, chat_id, "❌ عکس و متن خبر حادثه‌ای را بفرستید.")
+            await send_message(session, chat_id, "❌ عکس و متن خبر حادثه‌ای را بفرستید.", kb_main_menu())
             return
-        await send_message(session, chat_id, "🚨 در حال ساخت ریلز اضطراری حادثه‌ای (حدود ۲۰ تا ۳۰ ثانیه)...")
+        await send_message(session, chat_id, "🚨 در حال ساخت ریلز اضطراری حادثه‌ای (حدود ۲۰ ثانیه)...", kb_main_menu())
         spawn_bg_task(run_incident_job(session, chat_id, photo_path, text))
         return
 
@@ -1863,9 +1912,9 @@ async def handle_message(session: aiohttp.ClientSession, msg: dict):
         if msg.get("video"):
             vid = msg["video"]
             if vid.get("file_size", 0) > 19.5 * 1024 * 1024:
-                await send_message(session, chat_id, "⚠️ حجم فیلم بیشتر از ۲۰ مگابایت است (محدودیت تلگرام). لطفاً نسخه کم‌حجم‌تر بفرستید.")
+                await send_message(session, chat_id, "⚠️ حجم فیلم بیشتر از ۲۰ مگابایت است. نسخه کم‌حجم‌تر بفرستید.", kb_main_menu())
                 return
-            await send_message(session, chat_id, "🎥 در حال دیدن و شنیدن فیلم و نگارش کپشن ۶ بخشی...")
+            await send_message(session, chat_id, "🎥 در حال تحلیل تصویر و صدای فیلم و نگارش کپشن ۶ بخشی...")
             media_path = await download_tg_file(session, vid["file_id"], ".mp4")
             mime = vid.get("mime_type") or "video/mp4"
 
@@ -1877,37 +1926,36 @@ async def handle_message(session: aiohttp.ClientSession, msg: dict):
         elif msg.get("voice") or msg.get("audio"):
             aud = msg.get("voice") or msg.get("audio")
             if aud.get("file_size", 0) > 19.5 * 1024 * 1024:
-                await send_message(session, chat_id, "⚠️ حجم فایل صوتی بیشتر از ۲۰ مگابایت است.")
+                await send_message(session, chat_id, "⚠️ حجم فایل صوتی بیشتر از ۲۰ مگابایت است.", kb_main_menu())
                 return
             await send_message(session, chat_id, "🎙️ در حال شنیدن فایل صوتی و نگارش کپشن ۶ بخشی...")
             media_path = await download_tg_file(session, aud["file_id"], ".ogg")
             mime = aud.get("mime_type") or "audio/ogg"
 
         elif text:
-            await send_message(session, chat_id, "✍️ در حال نگارش کپشن ۶ بخشی دقیق @shirazlastnews...")
+            await send_message(session, chat_id, f"✍️ در حال نگارش کپشن ۶ بخشی دقیق {BRAND_HANDLE}...")
         else:
-            await send_message(session, chat_id, "❌ لطفاً متن، عکس، ویس یا فیلم بفرستید.")
+            await send_message(session, chat_id, "❌ لطفاً متن، عکس، ویس یا فیلم بفرستید.", kb_main_menu())
             return
 
         cap = await generate_editorial_caption(session, news_text=text, media_path=media_path, mime_type=mime)
         await send_caption_with_shield(session, chat_id, cap)
         first_hl = cap.splitlines()[0] if cap else text[:70]
         add_to_daily_items(first_hl, media_path if mime == "image/jpeg" else None, tag="خبر")
-        t, kb = build_main_menu()
-        await send_message(session, chat_id, t, kb)
         return
 
     if mode == "map_reel":
         if state["step"] == "wait_location":
             if not text:
-                await send_message(session, chat_id, "❌ نام محله یا شهر را به صورت متنی بفرستید:", build_cancel_kb())
+                await send_message(session, chat_id, "❌ نام محله یا شهر را به صورت متنی بفرستید:", kb_cancel())
                 return
             state["data"]["location"] = text
             state["step"] = "wait_photo"
             await send_message(
-                session, chat_id,
+                session,
+                chat_id,
                 f"📍 موقعیت ثبت شد: {text}\n\nمرحله ۲ از ۲: حالا عکس خبر را همراه با متن خبر بفرستید:",
-                build_cancel_kb(),
+                kb_cancel(),
             )
             return
 
@@ -1917,7 +1965,7 @@ async def handle_message(session: aiohttp.ClientSession, msg: dict):
             photo_path = ""
             if msg.get("photo"):
                 photo_path = await download_tg_file(session, msg["photo"][-1]["file_id"], ".jpg")
-            await send_message(session, chat_id, f"🗺️ در حال دریافت نقشه «{loc}» و ساخت ریلز زوم سینمایی...")
+            await send_message(session, chat_id, f"🗺️ در حال دریافت نقشه «{loc}» و ساخت ریلز زوم سینمایی...", kb_main_menu())
             spawn_bg_task(run_map_job(session, chat_id, loc, photo_path, text))
             return
 
@@ -1925,27 +1973,26 @@ async def handle_message(session: aiohttp.ClientSession, msg: dict):
         if state["step"] == "wait_audio":
             aud = msg.get("voice") or msg.get("audio")
             if not aud:
-                await send_message(session, chat_id, "❌ لطفاً ویس یا فایل صوتی بفرستید:", build_cancel_kb())
+                await send_message(session, chat_id, "❌ لطفاً ویس یا فایل صوتی بفرستید:", kb_cancel())
                 return
             if aud.get("file_size", 0) > 19.5 * 1024 * 1024:
-                await send_message(session, chat_id, "⚠️ حجم فایل صوتی باید کمتر از ۲۰ مگابایت باشد.")
+                await send_message(session, chat_id, "⚠️ حجم فایل صوتی باید کمتر از ۲۰ مگابایت باشد.", kb_cancel())
                 return
             state["data"]["audio"] = await download_tg_file(session, aud["file_id"], ".ogg")
             state["step"] = "wait_speaker"
-            kb = {
-                "inline_keyboard": [
-                    [{"text": "⏭️ بدون عکس گوینده (ادامه)", "callback_data": "audio_skip_photo"}],
-                    [{"text": "❌ انصراف", "callback_data": "main_menu"}],
-                ]
-            }
             await send_message(
-                session, chat_id,
-                "مرحله ۲ از ۲: عکس گوینده را همراه با تیتر خبر در کپشن بفرستید (یا دکمه «بدون عکس گوینده» را بزنید):",
-                kb,
+                session,
+                chat_id,
+                "مرحله ۲ از ۲: عکس گوینده را همراه با تیتر خبر در کپشن بفرستید (یا از منوی پایین «⏭️ بدون عکس گوینده» را بزنید):",
+                kb_cancel([{"text": BTN_SKIP_PHOTO}]),
             )
             return
 
         if state["step"] == "wait_speaker":
+            if is_pure_text and text == BTN_SKIP_PHOTO:
+                state["step"] = "wait_title"
+                await send_message(session, chat_id, "✏️ تیتر کوتاه خبر را بنویسید:", kb_cancel())
+                return
             aud_path = state["data"]["audio"]
             sp_photo = ""
             if msg.get("photo"):
@@ -1953,10 +2000,10 @@ async def handle_message(session: aiohttp.ClientSession, msg: dict):
             if not text:
                 state["data"]["photo"] = sp_photo
                 state["step"] = "wait_title"
-                await send_message(session, chat_id, "✏️ حالا تیتر کوتاه خبر را بنویسید:", build_cancel_kb())
+                await send_message(session, chat_id, "✏️ حالا تیتر کوتاه خبر را بنویسید:", kb_cancel())
                 return
             USER_STATE.pop(chat_id, None)
-            await send_message(session, chat_id, "🎙️ در حال ساخت ریلز موج صوتی...")
+            await send_message(session, chat_id, "🎙️ در حال ساخت ریلز موج صوتی...", kb_main_menu())
             spawn_bg_task(run_audiogram_job(session, chat_id, aud_path, sp_photo, text))
             return
 
@@ -1964,20 +2011,20 @@ async def handle_message(session: aiohttp.ClientSession, msg: dict):
             aud_path = state["data"]["audio"]
             sp_photo = state["data"].get("photo", "")
             USER_STATE.pop(chat_id, None)
-            await send_message(session, chat_id, "🎙️ در حال ساخت ریلز موج صوتی...")
+            await send_message(session, chat_id, "🎙️ در حال ساخت ریلز موج صوتی...", kb_main_menu())
             spawn_bg_task(run_audiogram_job(session, chat_id, aud_path, sp_photo, text or BRAND_TITLE_FA))
             return
 
     if mode == "video_studio":
         vid = msg.get("video")
         if not vid:
-            await send_message(session, chat_id, "❌ لطفاً یک فایل ویدئو (زیر ۲۰ مگابایت) بفرستید:", build_cancel_kb())
+            await send_message(session, chat_id, "❌ لطفاً یک فایل ویدئو (زیر ۲۰ مگابایت) بفرستید:", kb_video_studio())
             return
         if vid.get("file_size", 0) > 19.5 * 1024 * 1024:
-            await send_message(session, chat_id, "⚠️ حجم ویدئو بالای ۲۰ مگابایت است. لطفاً ویدئوی کوتاه‌تر یا فشرده‌تر بفرستید.")
+            await send_message(session, chat_id, "⚠️ حجم ویدئو بالای ۲۰ مگابایت است. نسخه کم‌حجم‌تر بفرستید.", kb_video_studio())
             return
         USER_STATE.pop(chat_id, None)
-        await send_message(session, chat_id, "🎞️ در حال تدوین هوشمند ویدئو و اعمال قاب ریلز (حدود ۳۰ تا ۶۰ ثانیه)...")
+        await send_message(session, chat_id, "🎞️ در حال تدوین هوشمند ویدئو و اعمال قاب ریلز (حدود ۳۰ تا ۶۰ ثانیه)...", kb_main_menu())
         vid_path = await download_tg_file(session, vid["file_id"], ".mp4")
         spawn_bg_task(run_video_studio_job(session, chat_id, vid_path, text))
         return
@@ -1985,26 +2032,19 @@ async def handle_message(session: aiohttp.ClientSession, msg: dict):
     if mode == "shadowban_check":
         USER_STATE.pop(chat_id, None)
         if not text:
-            await send_message(session, chat_id, "❌ متن را بفرستید.")
+            await send_message(session, chat_id, "❌ متن را بفرستید.", kb_main_menu())
             return
         LAST_CAPTION[chat_id] = text
         hits = check_shadowban_words(text)
         if not hits:
-            await send_message(session, chat_id, "✅ عالی! هیچ کلمه پرریسک و محدودیت‌زایی در متن شما پیدا نشد.")
+            await send_message(session, chat_id, "✅ عالی! هیچ کلمه پرریسک و محدودیت‌زایی در متن شما پیدا نشد.", kb_main_menu())
         else:
             lines = ["⚠️ کلمات حساس شناسایی‌شده در متن:"]
             for w, alt in hits:
                 lines.append(f"• «{w}» ← معادل ایمن: {alt}")
-            kb = {
-                "inline_keyboard": [
-                    [{"text": "✨ بازنویسی ایمن متن با هوش مصنوعی", "callback_data": "do_safe_rewrite"}],
-                    [{"text": "🔙 منوی اصلی", "callback_data": "main_menu"}],
-                ]
-            }
-            await send_message(session, chat_id, "\n".join(lines), kb)
-            return
-        t, kb = build_main_menu()
-        await send_message(session, chat_id, t, kb)
+            lines.append("\nبرای دریافت نسخه اصلاح‌شده، دکمه «✨ بازنویسی ایمن آخرین کپشن» را از منوی پایین بزنید.")
+            await send_message(session, chat_id, "\n".join(lines), kb_shadowban_actions())
+        return
 
 
 # ==================== حلقه اصلی ربات ====================
@@ -2023,7 +2063,13 @@ async def main():
             return
 
         await tg_api(session, "deleteWebhook", {"drop_pending_updates": False})
-        print(f"Studio Bot started at {get_tehran_now().strftime('%H:%M')} Tehran (event: {EVENT_NAME}).")
+        await tg_api(session, "setMyCommands", {
+            "commands": [
+                {"command": "start", "description": "باز کردن منوی اصلی استودیو"},
+                {"command": "menu", "description": "نمایش دکمه‌های منوی پایین"},
+            ]
+        })
+        print(f"Studio Bot started at {get_tehran_now().strftime('%H:%M')} Tehran | RAQM={HAS_RAQM}")
 
         offset = 0
         while should_keep_running(boot_time):
@@ -2034,13 +2080,13 @@ async def main():
                     CONFIG["last_occasion_date"] = today_key
                     await save_config_to_pin(session)
                     c_path, c_cap = await build_daily_occasion_card(session)
-                    await send_photo_file(session, ADMIN_ID, c_path, caption=c_cap)
+                    await send_photo_file(session, ADMIN_ID, c_path, caption=c_cap, reply_markup=kb_main_menu())
 
-                url = f"[https://api.telegram.org/bot](https://api.telegram.org/bot){BOT_TOKEN}/getUpdates"
+                url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
                 params = {
                     "offset": offset,
                     "timeout": 25,
-                    "allowed_updates": '["message","callback_query"]',
+                    "allowed_updates": '["message"]',
                 }
                 async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=35)) as resp:
                     if resp.status == 409:
@@ -2050,9 +2096,7 @@ async def main():
                         data = await resp.json()
                         for update in data.get("result", []):
                             offset = update["update_id"] + 1
-                            if "callback_query" in update:
-                                await handle_callback(session, update["callback_query"])
-                            elif "message" in update:
+                            if "message" in update:
                                 await handle_message(session, update["message"])
             except Exception as e:
                 print(f"Loop error: {e}")
