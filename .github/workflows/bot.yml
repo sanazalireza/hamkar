@@ -44,4 +44,13 @@ jobs:
           ADMIN_ID: ${{ secrets.ADMIN_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GITHUB_EVENT_NAME: ${{ github.event_name }}
-        run: python main.py
+        run: |
+          python - << 'EOF'
+          import re
+          with open("main.py", "r", encoding="utf-8") as f:
+              code = f.read()
+          code = re.sub(r"\[(https?://[^\]]+)\]\(https?://[^\)]+\)", r"\1", code)
+          with open("main.py", "w", encoding="utf-8") as f:
+              f.write(code)
+          EOF
+          python main.py
