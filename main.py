@@ -1225,9 +1225,9 @@ def build_scrolling_ticker_strip(text: str, duration_sec: float, bg_color=(185, 
 
 
 def pipe_frames_to_mp4(frame_generator, out_mp4: str, audio_path: str, fps: int = 25):
-    """ارسال مستقیم فریم‌های تصویر به FFmpeg با سرعت بالا و بدون خطاهای پیچیده فیلتر (حذف کامل ارور ۲۳۴)."""
+    """ارسال مستقیم فریم‌های تصویر به FFmpeg با سرعت بالا و بدون خطای flush of closed file."""
     cmd = [
-        "ffmpeg", "-y",
+        "ffmpeg", "-y", "-loglevel", "error",
         "-f", "rawvideo", "-vcodec", "rawvideo",
         "-pix_fmt", "rgb24", "-s", "1080x1920", "-r", str(fps),
         "-i", "-",
@@ -1239,13 +1239,27 @@ def pipe_frames_to_mp4(frame_generator, out_mp4: str, audio_path: str, fps: int 
         out_mp4,
     ]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    write_err = None
     try:
         for frame_rgb in frame_generator:
             proc.stdin.write(frame_rgb.tobytes())
+    except BrokenPipeError:
+        pass
+    except Exception as e:
+        write_err = e
     finally:
         if proc.stdin:
-            proc.stdin.close()
-    _, err = proc.communicate()
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+            proc.stdin = None
+    err = proc.stderr.read() if proc.stderr else b""
+    if proc.stderr:
+        proc.stderr.close()
+    proc.wait()
+    if write_err:
+        raise write_err
     if proc.returncode != 0:
         err_txt = err.decode("utf-8", errors="ignore")
         lines = [ln.strip() for ln in err_txt.splitlines() if ln.strip()]
