@@ -280,8 +280,20 @@ BTN_BACK = "🔙 بازگشت به منوی اصلی"
 BTN_CANCEL = "❌ انصراف و بازگشت"
 BTN_SKIP_PHOTO = "⏭️ بدون عکس گوینده"
 BTN_SAFE_REWRITE = "✨ بازنویسی ایمن آخرین کپشن"
-BTN_BUILD_POPART = "🚀 ساخت ریلز جمع‌بندی (برودکست)"
+BTN_STYLE_BROADCAST = "📺 ۱. برودکست شیشه‌ای"
+BTN_STYLE_SPLIT = "📰 ۲. دوپنجره‌ای تحریریه"
+BTN_STYLE_EDITORIAL = "🗞️ ۳. مطبوعاتی تحلیلی"
+BTN_STYLE_KINETIC = "⚡ ۴. اکسپلور تند"
+BTN_STYLE_LIVE = "📡 ۵. بولتین زنده"
 BTN_CLEAR_DAILY = "🧹 پاک کردن صف جمع‌بندی"
+
+DAILY_STYLE_MAP = {
+    BTN_STYLE_BROADCAST: ("broadcast", "برودکست شیشه‌ای"),
+    BTN_STYLE_SPLIT: ("split", "دوپنجره‌ای تحریریه"),
+    BTN_STYLE_EDITORIAL: ("editorial", "مطبوعاتی تحلیلی"),
+    BTN_STYLE_KINETIC: ("kinetic", "اکسپلور تند"),
+    BTN_STYLE_LIVE: ("live", "بولتین زنده تلویزیونی"),
+}
 
 # دکمه‌های انتخاب گوشه حذف واترمارک (مورد ۹)
 BTN_CORNER_TR = "↗️ گوشه بالا راست"
@@ -477,7 +489,9 @@ def extract_source_name(news_text: str) -> str:
 def kb_daily_collect() -> dict:
     return {
         "keyboard": [
-            [{"text": BTN_BUILD_POPART}],
+            [{"text": BTN_STYLE_BROADCAST}, {"text": BTN_STYLE_SPLIT}],
+            [{"text": BTN_STYLE_EDITORIAL}, {"text": BTN_STYLE_KINETIC}],
+            [{"text": BTN_STYLE_LIVE}],
             [{"text": BTN_CLEAR_DAILY}, {"text": BTN_BACK}],
         ],
         "resize_keyboard": True,
@@ -1863,21 +1877,20 @@ def build_map_zoom_reel_sync(wide_map: Image.Image, close_map: Image.Image, phot
     return out_mp4
 
 
-# ==================== ۴. ریلز جمع‌بندی ترکیبی (تمام‌صفحه + برودکست اریب + گرادیان شیشه‌ای) ====================
-def build_daily_summary_reel_sync(items: list) -> str:
+# ==================== ۴. موتور ۵ سبکی ریلز جمع‌بندی روزانه ====================
+def build_daily_summary_reel_sync(items: list, style: str = "broadcast") -> str:
     w, h, fps = 1080, 1920, 25
     work_dir = tempfile.mkdtemp(dir=TMP_ROOT)
     selected = items[:8]
-    n_news = len(selected)
+    n_news = max(1, len(selected))
 
-    # شبکه کم‌حجم برای رندر فوق‌سریع گرادیان اتمسفریک متحرک (مدل ۳)
+    # شبکه کم‌حجم برای گرادیان اتمسفریک متحرک
     gw, gh = 135, 240
     gy_grid, gx_grid = np.mgrid[0:gh, 0:gw].astype(np.float32)
     gx_norm = gx_grid / gw
     gy_norm = gy_grid / gh
 
     def make_dark_gradient_bg(t_sec: float, tint_rgb=(196, 22, 34)):
-        """پس‌زمینه ذغالی-سرمه‌ای با ۲ هاله نور متحرک سینمایی."""
         c1x = 0.25 + 0.18 * math.sin(t_sec * 0.65)
         c1y = 0.28 + 0.14 * math.cos(t_sec * 0.50)
         c2x = 0.78 + 0.16 * math.cos(t_sec * 0.55)
@@ -1893,10 +1906,7 @@ def build_daily_summary_reel_sync(items: list) -> str:
         return cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
 
     def apply_glass_box(bg_rgb: np.ndarray, box: tuple, radius: int = 34, tint=(14, 17, 25), alpha: float = 0.62) -> Image.Image:
-        """ساخت افکت شیشه مات واقعی (Glassmorphism) دقیقاً روی کادر مشخص‌شده از فریم زنده."""
-        x1, y1, x2, y2 = box
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(w, x2), min(h, y2)
+        x1, y1, x2, y2 = max(0, box[0]), max(0, box[1]), min(w, box[2]), min(h, box[3])
         bw, bh = x2 - x1, y2 - y1
         if bw < 20 or bh < 20:
             return Image.fromarray(bg_rgb).convert("RGBA")
@@ -1917,180 +1927,23 @@ def build_daily_summary_reel_sync(items: list) -> str:
         return Image.fromarray(out).convert("RGBA")
 
     def draw_broadcast_wipe(frame_rgba: Image.Image, mode: str, progress: float):
-        """ترنزیشن پرده اریب قرمز و ذغالی سبک شبکه‌های خبری (مدل ۲)."""
         d = ImageDraw.Draw(frame_rgba)
-        slant = 260
-        stripe_w = 88
+        slant, stripe_w = 260, 88
         charcoal = (18, 20, 25, 255)
         crimson = (204, 18, 28, 255)
-
         if mode == "in":
-            # ورود پرده از راست به چپ در پایان اسلاید
             lead_x = int(1380 - 1500 * (progress ** 1.35))
-            d.polygon([
-                (lead_x, 0), (lead_x + stripe_w, 0),
-                (lead_x + stripe_w - slant, h), (lead_x - slant, h)
-            ], fill=crimson)
-            d.polygon([
-                (lead_x + stripe_w, 0), (w + 400, 0),
-                (w + 400, h), (lead_x + stripe_w - slant, h)
-            ], fill=charcoal)
+            d.polygon([(lead_x, 0), (lead_x + stripe_w, 0), (lead_x + stripe_w - slant, h), (lead_x - slant, h)], fill=crimson)
+            d.polygon([(lead_x + stripe_w, 0), (w + 400, 0), (w + 400, h), (lead_x + stripe_w - slant, h)], fill=charcoal)
         else:
-            # خروج پرده به سمت چپ در ابتدای اسلاید جدید
             trail_x = int(1460 - 1540 * (progress ** 0.78))
-            d.polygon([
-                (-400, 0), (trail_x - stripe_w, 0),
-                (trail_x - stripe_w - slant, h), (-400, h)
-            ], fill=charcoal)
-            d.polygon([
-                (trail_x - stripe_w, 0), (trail_x, 0),
-                (trail_x - slant, h), (trail_x - stripe_w - slant, h)
-            ], fill=crimson)
+            d.polygon([(-400, 0), (trail_x - stripe_w, 0), (trail_x - stripe_w - slant, h), (-400, h)], fill=charcoal)
+            d.polygon([(trail_x - stripe_w, 0), (trail_x, 0), (trail_x - slant, h), (trail_x - stripe_w - slant, h)], fill=crimson)
 
-    # لایه ثابت گرادیانت تیره بالا و پایین برای خوانایی روی عکس‌های تمام‌صفحه (مدل ۱)
-    vignette = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    vd = ImageDraw.Draw(vignette)
-    for y in range(340):
-        vd.line([(0, y), (w, y)], fill=(10, 12, 18, int(215 * (1.0 - y / 340.0))))
-    for y in range(980, h):
-        r = (y - 980) / (h - 980)
-        vd.line([(0, y), (w, y)], fill=(10, 12, 18, int(242 * (r ** 1.25))))
-
-    # بارگذاری لوگوی دروازه قرآن (logo.png)
-    logo_img = None
-    logo_path = find_repo_logo()
-    if logo_path:
-        try:
-            logo_img = Image.open(logo_path).convert("RGBA")
-        except Exception:
-            logo_img = None
-
-    jnow = jdatetime.datetime.fromgregorian(datetime=get_tehran_now())
-    date_str = to_persian_digits(f"{JALALI_WEEKDAYS[jnow.weekday()]} {jnow.day} {JALALI_MONTHS[jnow.month]} {jnow.year}")
-
-    # --- ۱. آماده‌سازی گرافیک مقدمه (گرادیان تاریک + کارت شیشه‌ای) ---
-    intro_box = (66, 610, w - 66, 1270)
-    intro_ov = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    idraw = ImageDraw.Draw(intro_ov)
-    idraw.rounded_rectangle(intro_box, radius=36, outline=(255, 255, 255, 68), width=3)
-    idraw.rectangle([(w - 92, 665), (w - 80, 1215)], fill=(204, 18, 28, 255))
-    if logo_img:
-        lg = logo_img.copy()
-        lg.thumbnail((170, 130), Image.Resampling.LANCZOS)
-        intro_ov.alpha_composite(lg, ((w - lg.width) // 2, 360))
-    else:
-        draw_quran_gate_fallback(idraw, (w - 130) // 2, 360, 130)
-    # برچسب اریب قرمز بالای کارت مقدمه
-    idraw.polygon([(340, 566), (760, 566), (732, 636), (312, 636)], fill=(204, 18, 28, 255))
-    draw_rtl_text(idraw, (536, 578), "بسته خبری روزانه", load_font("bold", 38), (255, 255, 255, 255), align="center", shadow=False)
-    draw_rtl_text(idraw, (w // 2, 720), "۶۰ ثانیه با مهم ترین اخبار امروز", load_font("display", 90), (255, 255, 255, 255), align="center")
-    draw_rtl_text(idraw, (w // 2, 875), date_str, load_font("bold", 40), (210, 218, 232, 255), align="center", shadow=False)
-    idraw.line([(210, 965), (w - 210, 965)], fill=(255, 255, 255, 55), width=2)
-    draw_rtl_text(
-        idraw, (w // 2, 1015),
-        f" {to_persian_digits(str(n_news))} مهم‌ترین خبرهای امروز",
-        load_font("bold", 38), (242, 200, 68, 255), align="center", shadow=False
-    )
-    draw_rtl_text(idraw, (w // 2, 1140), "@ShirazLastNews", load_font("bold", 36), (205, 212, 224, 255), align="center", shadow=False, is_rtl=False)
-
-    # --- ۲. آماده‌سازی اسلایدهای خبرها (عکس تمام‌صفحه + کارت شیشه‌ای تیتر + HUD برودکست) ---
-    news_slides = []
-    card_box_base = (52, 1235, w - 52, 1655)
-    cb_w = card_box_base[2] - card_box_base[0]
-    cb_h = card_box_base[3] - card_box_base[1]
-
-    for idx, item in enumerate(selected, start=1):
-        photo_p = item.get("photo")
-        has_photo = bool(photo_p and os.path.exists(photo_p))
-        photo_arr = None
-        if has_photo:
-            photo_arr = np.array(fit_cover(Image.open(photo_p).convert("RGB"), 1220, 2168), dtype=np.uint8)
-
-        tag_txt = strip_emojis_for_font(item.get("tag", "مهم‌ترین خبرها")) or "مهم‌ترین خبر"
-        if "فوری" in tag_txt or "حادثه" in tag_txt:
-            accent_c = (214, 22, 34)
-        elif "ورزش" in tag_txt:
-            accent_c = (22, 163, 74)
-        elif "اقتصاد" in tag_txt:
-            accent_c = (217, 152, 16)
-        else:
-            accent_c = (204, 18, 28)
-
-        # رندر محتوای کارت شیشه‌ای در یک لایه مستقل تا به‌صورت نرم از پایین بالا بیاید
-        card_content = Image.new("RGBA", (cb_w, cb_h), (0, 0, 0, 0))
-        cd = ImageDraw.Draw(card_content)
-        cd.rounded_rectangle([(0, 0), (cb_w - 1, cb_h - 1)], radius=34, outline=(255, 255, 255, 78), width=3)
-        # خط عمودی رنگی هویت برند سمت راست کارت
-        cd.rounded_rectangle([(cb_w - 28, 34), (cb_w - 14, cb_h - 34)], radius=7, fill=accent_c + (255,))
-        # برچسب اریب دسته خبر داخل بالای کارت
-        cd.polygon([(cb_w - 310, 26), (cb_w - 46, 26), (cb_w - 46, 82), (cb_w - 332, 82)], fill=accent_c + (255,))
-        draw_centered_block_in_box(
-            cd, (cb_w - 312, 30, cb_w - 50, 78), tag_txt, "bold", (255, 255, 255, 255),
-            max_size=30, min_size=20, max_lines=1, align="center", pad_x=10, pad_y=2
-        )
-        # ساعت ثبت خبر در سمت چپ بالای کارت
-        t_lbl = to_persian_digits(item.get("time", ""))
-        if t_lbl:
-            draw_rtl_text(cd, (36, 40), f"ساعت {t_lbl}", load_font("regular", 26), (195, 205, 220, 220), align="left", shadow=False)
-
-        # تیتر اصلی درشت و خوانا
-        draw_centered_block_in_box(
-            cd, (34, 98, cb_w - 50, cb_h - 32),
-            item["headline"], "display", (255, 255, 255, 255),
-            max_size=62, min_size=32, max_lines=3, align="right", pad_x=12, pad_y=6, shadow=True
-        )
-
-        # هدر برودکست بالا (لوگو + شمارنده ۰۱ / ۰۶)
-        hud_top = Image.new("RGBA", (w, 260), (0, 0, 0, 0))
-        hd = ImageDraw.Draw(hud_top)
-        if logo_img:
-            lg = logo_img.copy()
-            lg.thumbnail((110, 82), Image.Resampling.LANCZOS)
-            hud_top.alpha_composite(lg, (52, 102))
-        else:
-            draw_quran_gate_fallback(hd, 52, 102, 78)
-        draw_rtl_text(hd, (172, 128), "@ShirazLastNews", load_font("bold", 28), (235, 240, 248, 220), align="left", shadow=True, is_rtl=False)
-
-        cnt_str = to_persian_digits(f"{idx:02d} / {n_news:02d}")
-        hd.rounded_rectangle([(w - 260, 106), (w - 48, 174)], radius=34, fill=(16, 18, 24, 210), outline=(255, 255, 255, 75), width=2)
-        hd.ellipse([(w - 92, 128), (w - 68, 152)], fill=accent_c + (255,))
-        draw_rtl_text(hd, (w - 175, 120), cnt_str, load_font("bold", 34), (255, 255, 255, 255), align="center", shadow=False, is_rtl=False)
-
-        news_slides.append({
-            "photo_arr": photo_arr,
-            "accent": accent_c,
-            "card_content": card_content,
-            "hud_top": hud_top,
-            "dur": 4.8,
-        })
-
-    # --- ۳. آماده‌سازی گرافیک پایان (گرادیان تاریک + کارت شیشه‌ای فالو) ---
-    outro_box = (72, 690, w - 72, 1210)
-    outro_ov = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    od = ImageDraw.Draw(outro_ov)
-    od.rounded_rectangle(outro_box, radius=36, outline=(255, 255, 255, 72), width=3)
-    draw_rtl_text(od, (w // 2, 755), BRAND_TITLE_FA, load_font("display", 82), (255, 255, 255, 255), align="center")
-    draw_rtl_text(od, (w // 2, 895), "برای پیگیری لحظه‌ای اخبار ایران و شیراز فالو کنید", load_font("bold", 36), (210, 218, 232, 255), align="center", shadow=False)
-    od.rounded_rectangle([(255, 1005), (825, 1115)], radius=24, fill=(204, 18, 28, 255))
-    draw_rtl_text(od, (w // 2, 1034), "@ShirazLastNews", load_font("bold", 46), (255, 255, 255, 255), align="center", shadow=False, is_rtl=False)
-
-    # انتخاب فایل صوتی اختصاصی از مخزن (daily.mp3 یا news.mp3)
-    total_sec = 2.4 + sum(s["dur"] for s in news_slides) + 2.3
-    audio_path = ""
-    for cand in ("daily.mp3", "sounds/daily.mp3", "news.mp3", "sounds/news.mp3"):
-        if os.path.exists(cand) and os.path.getsize(cand) > 4000:
-            audio_path = cand
-            break
-    if not audio_path:
-        audio_path = get_audio_track(work_dir, total_sec, mode="news")
-
-    out_mp4 = os.path.join(TMP_ROOT, f"broadcast_daily_{int(time.time()*1000)}.mp4")
-
-    def draw_progress_bars(frame_rgba: Image.Image, current_idx: int, frac: float):
-        """نوارهای پیشرفت ۶ تایی بالای صفحه (مدل ۱)."""
+    def draw_progress_bars(frame_rgba: Image.Image, current_idx: int, frac: float, bar_y: int = 58):
         pd = ImageDraw.Draw(frame_rgba)
-        margin_x, gap, bar_y, bar_h = 46, 12, 58, 9
-        seg_w = (w - margin_x * 2 - gap * (n_news - 1)) / max(1, n_news)
+        margin_x, gap, bar_h = 46, 12, 9
+        seg_w = (w - margin_x * 2 - gap * (n_news - 1)) / n_news
         for s in range(n_news):
             sx1 = int(margin_x + s * (seg_w + gap))
             sx2 = int(sx1 + seg_w)
@@ -2101,76 +1954,459 @@ def build_daily_summary_reel_sync(items: list) -> str:
                 fw = max(10, int(seg_w * max(0.0, min(1.0, frac))))
                 pd.rounded_rectangle([(sx1, bar_y), (sx1 + fw, bar_y + bar_h)], radius=5, fill=(220, 28, 38, 255))
 
+    def get_accent_for_tag(tag_txt: str) -> tuple:
+        if "فوری" in tag_txt or "حادثه" in tag_txt:
+            return (214, 22, 34)
+        if "ورزش" in tag_txt:
+            return (22, 163, 74)
+        if "اقتصاد" in tag_txt:
+            return (217, 152, 16)
+        return (204, 18, 28)
+
+    def paste_logo(target_rgba: Image.Image, draw_obj: ImageDraw.ImageDraw, x: int, y: int, mw: int = 110, mh: int = 82):
+        if logo_img:
+            lg = logo_img.copy()
+            lg.thumbnail((mw, mh), Image.Resampling.LANCZOS)
+            target_rgba.alpha_composite(lg, (x, y))
+        else:
+            draw_quran_gate_fallback(draw_obj, x, y, min(mw, mh))
+
+    # سایه بالا و پایین برای خوانایی روی عکس‌های تمام‌صفحه
+    vignette = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    vd = ImageDraw.Draw(vignette)
+    for y in range(340):
+        vd.line([(0, y), (w, y)], fill=(10, 12, 18, int(215 * (1.0 - y / 340.0))))
+    for y in range(980, h):
+        r = (y - 980) / (h - 980)
+        vd.line([(0, y), (w, y)], fill=(10, 12, 18, int(242 * (r ** 1.25))))
+
+    logo_img = None
+    logo_path = find_repo_logo()
+    if logo_path:
+        try:
+            logo_img = Image.open(logo_path).convert("RGBA")
+        except Exception:
+            logo_img = None
+
+    now_tehran = get_tehran_now()
+    jnow = jdatetime.datetime.fromgregorian(datetime=now_tehran)
+    date_str = to_persian_digits(f"{JALALI_WEEKDAYS[jnow.weekday()]} {jnow.day} {JALALI_MONTHS[jnow.month]} {jnow.year}")
+    clock_str = to_persian_digits(now_tehran.strftime("%H:%M"))
+
+    # --- مقدمه مشترک (بدون عدد تعداد خبرها روی اسلاید اول) ---
+    intro_box = (66, 610, w - 66, 1270)
+    intro_ov = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    idraw = ImageDraw.Draw(intro_ov)
+    idraw.rounded_rectangle(intro_box, radius=36, outline=(255, 255, 255, 68), width=3)
+    idraw.rectangle([(w - 92, 665), (w - 80, 1215)], fill=(204, 18, 28, 255))
+    paste_logo(intro_ov, idraw, (w - 140) // 2, 360, 170, 130)
+
+    intro_tag_map = {
+        "broadcast": "بسته خبری روزانه",
+        "split": "گزارش تحریریه",
+        "editorial": "پرونده خبری امروز",
+        "kinetic": "مرور سریع اخبار",
+        "live": "بولتین زنده خبری",
+    }
+    idraw.polygon([(330, 566), (770, 566), (742, 636), (302, 636)], fill=(204, 18, 28, 255))
+    draw_rtl_text(idraw, (536, 578), intro_tag_map.get(style, "بسته خبری روزانه"), load_font("bold", 38), (255, 255, 255, 255), align="center", shadow=False)
+    draw_rtl_text(idraw, (w // 2, 720), "۶۰ ثانیه با مهم‌ترین خبرها", load_font("display", 90), (255, 255, 255, 255), align="center")
+    draw_rtl_text(idraw, (w // 2, 875), date_str, load_font("bold", 40), (210, 218, 232, 255), align="center", shadow=False)
+    idraw.line([(210, 965), (w - 210, 965)], fill=(255, 255, 255, 55), width=2)
+    draw_rtl_text(idraw, (w // 2, 1015), "مرور سریع مهم‌ترین اخبار ایران و شیراز", load_font("bold", 36), (242, 200, 68, 255), align="center", shadow=False)
+    draw_rtl_text(idraw, (w // 2, 1140), "@ShirazLastNews", load_font("bold", 36), (205, 212, 224, 255), align="center", shadow=False, is_rtl=False)
+
+    # --- اسلاید پایانی مشترک ---
+    outro_box = (72, 690, w - 72, 1210)
+    outro_ov = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    od = ImageDraw.Draw(outro_ov)
+    od.rounded_rectangle(outro_box, radius=36, outline=(255, 255, 255, 72), width=3)
+    draw_rtl_text(od, (w // 2, 755), BRAND_TITLE_FA, load_font("display", 82), (255, 255, 255, 255), align="center")
+    draw_rtl_text(od, (w // 2, 895), "برای پیگیری لحظه‌ای اخبار ایران و شیراز فالو کنید", load_font("bold", 36), (210, 218, 232, 255), align="center", shadow=False)
+    od.rounded_rectangle([(255, 1005), (825, 1115)], radius=24, fill=(204, 18, 28, 255))
+    draw_rtl_text(od, (w // 2, 1034), "@ShirazLastNews", load_font("bold", 46), (255, 255, 255, 255), align="center", shadow=False, is_rtl=False)
+
+    # زمان‌بندی هر سبک
+    intro_dur = 1.8 if style == "kinetic" else 2.4
+    outro_dur = 1.8 if style == "kinetic" else 2.2
+    item_dur = 3.5 if style == "kinetic" else 4.8
+    total_sec = intro_dur + len(selected) * item_dur + outro_dur
+
+    # انتخاب فایل صوتی اختصاصی از مخزن
+    audio_path = ""
+    for cand in ("daily.mp3", "sounds/daily.mp3", "news.mp3", "sounds/news.mp3"):
+        if os.path.exists(cand) and os.path.getsize(cand) > 4000:
+            audio_path = cand
+            break
+    if not audio_path:
+        audio_path = get_audio_track(work_dir, total_sec, mode="news")
+
+    out_mp4 = os.path.join(TMP_ROOT, f"daily_{style}_{int(time.time()*1000)}.mp4")
+
+    # نوار زیرنویس پیوسته برای سبک‌های split و live
+    ticker_strip = None
+    if style in ("split", "live"):
+        all_hls = "   ●   ".join(strip_emojis_for_font(it["headline"]) for it in selected if it.get("headline"))
+        t_bg = (192, 20, 30, 245) if style == "live" else (24, 28, 38, 245)
+        ticker_strip = build_scrolling_ticker_strip(all_hls, total_sec + 4.0, bg_color=t_bg, height=74)
+
+    # پس‌زمینه بافت‌دار مطبوعاتی برای سبک editorial
+    paper_bg_arr = None
+    if style == "editorial":
+        rng = np.random.default_rng(42)
+        base_p = np.full((h, w, 3), (22, 24, 30), dtype=np.int16)
+        noise = rng.integers(-8, 9, size=(h // 2, w // 2, 1), dtype=np.int16)
+        noise_full = cv2.resize(noise.astype(np.float32), (w, h), interpolation=cv2.INTER_NEAREST)[:, :, None].astype(np.int16)
+        paper_bg_arr = np.clip(base_p + noise_full, 0, 255).astype(np.uint8)
+
+    # ==================== آماده‌سازی اسلایدها متناسب با سبک انتخابی ====================
+    prepared = []
+    for idx, item in enumerate(selected, start=1):
+        photo_p = item.get("photo")
+        has_photo = bool(photo_p and os.path.exists(photo_p))
+        tag_txt = strip_emojis_for_font(item.get("tag", "خبر شیراز")) or "خبر شیراز"
+        hl_txt = strip_emojis_for_font(item.get("headline", "")) or BRAND_TITLE_FA
+        accent_c = get_accent_for_tag(tag_txt)
+        t_lbl = to_persian_digits(item.get("time", ""))
+        cnt_str = to_persian_digits(f"{idx:02d} / {n_news:02d}")
+
+        entry = {
+            "idx": idx,
+            "tag": tag_txt,
+            "headline": hl_txt,
+            "accent": accent_c,
+            "time": t_lbl,
+            "cnt": cnt_str,
+            "dur": item_dur,
+            "photo_arr": None,
+        }
+
+        if style == "broadcast":
+            if has_photo:
+                entry["photo_arr"] = np.array(fit_cover(Image.open(photo_p).convert("RGB"), 1220, 2168), dtype=np.uint8)
+            card_box_base = (52, 1235, w - 52, 1655)
+            cb_w, cb_h = card_box_base[2] - card_box_base[0], card_box_base[3] - card_box_base[1]
+            card_content = Image.new("RGBA", (cb_w, cb_h), (0, 0, 0, 0))
+            cd = ImageDraw.Draw(card_content)
+            cd.rounded_rectangle([(0, 0), (cb_w - 1, cb_h - 1)], radius=34, outline=(255, 255, 255, 78), width=3)
+            cd.rounded_rectangle([(cb_w - 28, 34), (cb_w - 14, cb_h - 34)], radius=7, fill=accent_c + (255,))
+            cd.polygon([(cb_w - 310, 26), (cb_w - 46, 26), (cb_w - 46, 82), (cb_w - 332, 82)], fill=accent_c + (255,))
+            draw_centered_block_in_box(cd, (cb_w - 312, 30, cb_w - 50, 78), tag_txt, "bold", (255, 255, 255, 255), max_size=30, min_size=20, max_lines=1)
+            if t_lbl:
+                draw_rtl_text(cd, (36, 40), f"ساعت {t_lbl}", load_font("regular", 26), (195, 205, 220, 220), align="left", shadow=False)
+            draw_centered_block_in_box(cd, (34, 98, cb_w - 50, cb_h - 32), hl_txt, "display", (255, 255, 255, 255), max_size=62, min_size=32, max_lines=3, align="right", pad_x=12, pad_y=6, shadow=True)
+
+            hud_top = Image.new("RGBA", (w, 260), (0, 0, 0, 0))
+            hd = ImageDraw.Draw(hud_top)
+            paste_logo(hud_top, hd, 52, 102, 110, 82)
+            draw_rtl_text(hd, (172, 128), "@ShirazLastNews", load_font("bold", 28), (235, 240, 248, 220), align="left", shadow=True, is_rtl=False)
+            hd.rounded_rectangle([(w - 260, 106), (w - 48, 174)], radius=34, fill=(16, 18, 24, 210), outline=(255, 255, 255, 75), width=2)
+            hd.ellipse([(w - 92, 128), (w - 68, 152)], fill=accent_c + (255,))
+            draw_rtl_text(hd, (w - 175, 120), cnt_str, load_font("bold", 34), (255, 255, 255, 255), align="center", shadow=False, is_rtl=False)
+            entry["card_content"] = card_content
+            entry["hud_top"] = hud_top
+
+        elif style == "split":
+            # نیمه بالا (1080x1020) عکس خبر + نیمه پایین (900px) ذغالی رسمی تحریریه
+            if has_photo:
+                entry["photo_arr"] = np.array(fit_cover(Image.open(photo_p).convert("RGB"), 1220, 1152), dtype=np.uint8)
+            static_split = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+            sd = ImageDraw.Draw(static_split)
+            for y in range(220):
+                sd.line([(0, y), (w, y)], fill=(12, 14, 20, int(195 * (1.0 - y / 220.0))))
+            sd.rectangle([(0, 1020), (w, h)], fill=(17, 20, 27, 255))
+            sd.rectangle([(0, 1012), (w, 1024)], fill=accent_c + (255,))
+            paste_logo(static_split, sd, 48, 92, 104, 78)
+            sd.rounded_rectangle([(w - 255, 96), (w - 46, 162)], radius=30, fill=(14, 16, 22, 220), outline=(255, 255, 255, 80), width=2)
+            draw_rtl_text(sd, (w - 150, 108), cnt_str, load_font("bold", 32), (255, 255, 255, 255), align="center", shadow=False, is_rtl=False)
+            sd.polygon([(w - 350, 976), (w - 46, 976), (w - 46, 1052), (w - 380, 1052)], fill=accent_c + (255,))
+            draw_centered_block_in_box(sd, (w - 350, 982, w - 54, 1046), tag_txt, "bold", (255, 255, 255, 255), max_size=32, min_size=22, max_lines=1)
+            draw_rtl_text(sd, (54, 1072), f"@ShirazLastNews  |  {date_str}", load_font("regular", 26), (170, 180, 198, 230), align="left", shadow=False, is_rtl=False)
+            sd.line([(54, 1126), (w - 54, 1126)], fill=(255, 255, 255, 42), width=2)
+            entry["static_split"] = static_split
+
+            text_layer = Image.new("RGBA", (w, 560), (0, 0, 0, 0))
+            td = ImageDraw.Draw(text_layer)
+            td.rectangle([(w - 66, 36), (w - 52, 430)], fill=accent_c + (255,))
+            draw_centered_block_in_box(td, (60, 26, w - 90, 440), hl_txt, "display", (255, 255, 255, 255), max_size=70, min_size=36, max_lines=4, align="right", pad_x=10, pad_y=6, shadow=True)
+            if t_lbl:
+                draw_rtl_text(td, (w - 90, 466), f"ساعت مخابره خبر: {t_lbl}", load_font("regular", 28), (185, 195, 212, 225), align="right", shadow=False)
+            entry["text_layer"] = text_layer
+
+        elif style == "editorial":
+            # سبک مطبوعاتی و تحلیلی با خط هایلایتر متحرک زیر تیتر
+            if has_photo:
+                entry["photo_arr"] = np.array(fit_cover(Image.open(photo_p).convert("RGB"), 1020, 820), dtype=np.uint8)
+            ed_frame = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+            ed = ImageDraw.Draw(ed_frame)
+            paste_logo(ed_frame, ed, 54, 96, 102, 76)
+            draw_rtl_text(ed, (w - 54, 108), f"پرونده خبری  |  {date_str}", load_font("bold", 30), (225, 216, 196, 240), align="right", shadow=False)
+            ed.line([(54, 198), (w - 54, 198)], fill=(225, 216, 196, 110), width=2)
+            ed.rounded_rectangle([(w - 320, 1068), (w - 64, 1130)], radius=10, fill=accent_c + (255,))
+            draw_centered_block_in_box(ed, (w - 314, 1072, w - 70, 1126), tag_txt, "bold", (255, 255, 255, 255), max_size=30, min_size=20, max_lines=1)
+            draw_rtl_text(ed, (64, 1080), cnt_str, load_font("bold", 34), (225, 216, 196, 210), align="left", shadow=False, is_rtl=False)
+            ed.line([(54, 1740), (w - 54, 1740)], fill=(225, 216, 196, 85), width=2)
+            draw_rtl_text(ed, (w - 54, 1766), BRAND_TITLE_FA, load_font("bold", 30), (225, 216, 196, 220), align="right", shadow=False)
+            draw_rtl_text(ed, (54, 1768), "@ShirazLastNews", load_font("bold", 30), (242, 200, 68, 240), align="left", shadow=False, is_rtl=False)
+            entry["ed_frame"] = ed_frame
+
+            # محاسبه جای دقیق خطوط تیتر برای افکت هایلایتر متحرک
+            hl_lay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+            hd = ImageDraw.Draw(hl_lay)
+            f_ed, ed_lines, ed_lh = fit_text_in_box(hd, hl_txt, "display", w - 148, 460, max_size=68, min_size=36, max_lines=4, line_spacing=1.42)
+            line_rects = []
+            cur_y = 1175
+            for ln in ed_lines:
+                t_draw, kw = prepare_text_and_kwargs(ln, is_rtl=True)
+                bb = hd.textbbox((0, 0), t_draw, font=f_ed, **kw)
+                lw = bb[2] - bb[0]
+                rx2 = w - 68
+                rx1 = max(68, rx2 - lw - 24)
+                line_rects.append((rx1, cur_y + int(ed_lh * 0.56), rx2 + 8, cur_y + int(ed_lh * 0.86)))
+                draw_rtl_text(hd, (w - 74, cur_y), ln, f_ed, (250, 248, 242, 255), align="right", shadow=True, shadow_offset=3)
+                cur_y += ed_lh
+            entry["hl_lay"] = hl_lay
+            entry["line_rects"] = line_rects
+
+        elif style == "kinetic":
+            # سبک اکسپلور تند: کنتراست بالا + نوار مشکی پشت هر خط تیتر با ورود خط‌به‌خط
+            if has_photo:
+                im_k = fit_cover(Image.open(photo_p).convert("RGB"), 1280, 2276)
+                arr_k = cv2.convertScaleAbs(np.array(im_k, dtype=np.uint8), alpha=1.14, beta=-8)
+                entry["photo_arr"] = arr_k
+            k_hud = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+            kd = ImageDraw.Draw(k_hud)
+            kd.rounded_rectangle([(52, 102), (350, 174)], radius=14, fill=accent_c + (248,))
+            draw_centered_block_in_box(kd, (60, 106, 342, 170), tag_txt, "bold", (255, 255, 255, 255), max_size=34, min_size=22, max_lines=1)
+            draw_rtl_text(kd, (w - 56, 84), to_persian_digits(f"{idx:02d}"), load_font("display", 118), (255, 255, 255, 235), align="right", shadow=True, shadow_offset=6)
+            draw_rtl_text(kd, (w // 2, 1775), "@ShirazLastNews", load_font("bold", 34), (255, 255, 255, 230), align="center", shadow=True, is_rtl=False)
+            entry["k_hud"] = k_hud
+
+            probe = ImageDraw.Draw(Image.new("RGBA", (w, h)))
+            fk, k_lines, k_lh = fit_text_in_box(probe, hl_txt, "display", w - 160, 460, max_size=74, min_size=38, max_lines=4, line_spacing=1.42)
+            tot_h = len(k_lines) * k_lh
+            start_y = 1130 + (460 - tot_h) // 2
+            line_layers = []
+            for li, ln in enumerate(k_lines):
+                lay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+                ld = ImageDraw.Draw(lay)
+                t_draw, kw = prepare_text_and_kwargs(ln, is_rtl=True)
+                bb = ld.textbbox((0, 0), t_draw, font=fk, **kw)
+                lw = bb[2] - bb[0]
+                lh_b = bb[3] - bb[1]
+                ly = start_y + li * k_lh
+                box_c = (accent_c + (245,)) if li == 0 else (12, 14, 18, 238)
+                ld.rounded_rectangle([(w // 2 - lw // 2 - 34, ly - 10), (w // 2 + lw // 2 + 34, ly + lh_b + 26)], radius=14, fill=box_c)
+                draw_rtl_text(ld, (w // 2, ly), ln, fk, (255, 255, 255, 255), align="center", shadow=False)
+                line_layers.append(lay)
+            entry["line_layers"] = line_layers
+
+        elif style == "live":
+            # سبک بولتین زنده تلویزیونی (استودیو خبر + ساعت زنده + مانیتور وسط + زیرنویس پیوسته)
+            if has_photo:
+                entry["photo_arr"] = np.array(fit_cover(Image.open(photo_p).convert("RGB"), 1080, 1080), dtype=np.uint8)
+            live_ov = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+            ld = ImageDraw.Draw(live_ov)
+            # هدر بالای شبکه خبر
+            ld.rectangle([(0, 0), (w, 198)], fill=(15, 19, 28, 255))
+            ld.rectangle([(0, 192), (w, 200)], fill=(204, 18, 28, 255))
+            paste_logo(live_ov, ld, 46, 36, 105, 80)
+            # نشان LIVE
+            ld.rounded_rectangle([(46, 126), (192, 174)], radius=24, fill=(30, 32, 40, 255), outline=(204, 18, 28, 220), width=2)
+            draw_rtl_text(ld, (104, 134), "LIVE", load_font("bold", 26), (255, 255, 255, 255), align="left", shadow=False, is_rtl=False)
+            # ساعت زنده و تاریخ بالا راست
+            ld.rounded_rectangle([(w - 280, 44), (w - 46, 114)], radius=14, fill=(204, 18, 28, 255))
+            draw_rtl_text(ld, (w - 163, 56), f"ساعت {clock_str}", load_font("bold", 34), (255, 255, 255, 255), align="center", shadow=False)
+            draw_rtl_text(ld, (w - 48, 132), f"{date_str}  |  بولتین خبری", load_font("regular", 26), (205, 214, 228, 235), align="right", shadow=False)
+            # قاب مانیتور میانی
+            ld.rounded_rectangle([(46, 252), (w - 46, 1226)], radius=26, outline=(255, 255, 255, 88), width=4)
+            # برچسب روی گوشه پایین راست مانیتور
+            ld.polygon([(w - 400, 1152), (w - 50, 1152), (w - 50, 1222), (w - 432, 1222)], fill=accent_c + (245,))
+            draw_centered_block_in_box(ld, (w - 396, 1156, w - 58, 1218), f"{tag_txt}  |  {cnt_str}", "bold", (255, 255, 255, 255), max_size=28, min_size=20, max_lines=1)
+            # پلیت تیتر رسمی پایین مانیتور (Lower-Third استودیویی)
+            ld.rounded_rectangle([(46, 1268), (w - 46, 1666)], radius=24, fill=(20, 26, 38, 248), outline=(255, 255, 255, 65), width=3)
+            ld.rectangle([(w - 72, 1296), (w - 56, 1638)], fill=accent_c + (255,))
+            draw_centered_block_in_box(ld, (76, 1294, w - 92, 1640), hl_txt, "display", (255, 255, 255, 255), max_size=64, min_size=34, max_lines=3, align="right", pad_x=10, pad_y=6, shadow=True)
+            # نوار آیدی پیج زیر زیرنویس
+            draw_rtl_text(ld, (w // 2, 1844), f"{BRAND_TITLE_FA}  |  @ShirazLastNews", load_font("bold", 28), (205, 214, 228, 225), align="center", shadow=False)
+            entry["live_ov"] = live_ov
+
+        prepared.append(entry)
+
+    # ==================== تولید فریم‌ها بر اساس سبک ====================
     def frame_gen():
         global_t = 0.0
-        wipe_dur = 0.26
+        wipe_dur = 0.25
 
-        # ۱. فریم‌های مقدمه (2.4 ثانیه)
-        n_intro = int(2.4 * fps)
+        # ۱. مقدمه
+        n_intro = int(intro_dur * fps)
         for i in range(n_intro):
             lt = i / fps
             global_t += 1.0 / fps
             bg = make_dark_gradient_bg(global_t, (204, 18, 28))
-            dy = int(75 * ((1.0 - min(1.0, lt / 0.55)) ** 3))
-            shifted_box = (intro_box[0], intro_box[1] + dy, intro_box[2], intro_box[3] + dy)
-            frame = apply_glass_box(bg, shifted_box, radius=36, alpha=0.58)
+            dy = int(75 * ((1.0 - min(1.0, lt / 0.50)) ** 3))
+            s_box = (intro_box[0], intro_box[1] + dy, intro_box[2], intro_box[3] + dy)
+            frame = apply_glass_box(bg, s_box, radius=36, alpha=0.58)
             frame.alpha_composite(intro_ov, (0, dy))
-            if lt > (2.4 - wipe_dur):
-                draw_broadcast_wipe(frame, "in", (lt - (2.4 - wipe_dur)) / wipe_dur)
+            if lt > (intro_dur - wipe_dur):
+                draw_broadcast_wipe(frame, "in", (lt - (intro_dur - wipe_dur)) / wipe_dur)
             yield np.array(frame.convert("RGB"), dtype=np.uint8)
 
-        # ۲. فریم‌های خبرها
-        for s_idx, sl in enumerate(news_slides):
+        # ۲. اسلایدهای خبرها
+        for s_idx, sl in enumerate(prepared):
             dur = sl["dur"]
             n_f = int(dur * fps)
             photo_arr = sl["photo_arr"]
+
             for i in range(n_f):
                 lt = i / fps
                 global_t += 1.0 / fps
 
-                if photo_arr is not None:
-                    ah, aw = photo_arr.shape[:2]
-                    z = 1.0 + 0.09 * (lt / dur)
-                    cw, ch = int(aw / z), int(ah / z)
-                    x0, y0 = (aw - cw) // 2, (ah - ch) // 2
-                    bg_rgb = cv2.resize(photo_arr[y0:y0 + ch, x0:x0 + cw], (w, h), interpolation=cv2.INTER_LINEAR)
-                else:
-                    bg_rgb = make_dark_gradient_bg(global_t, sl["accent"])
+                if style == "broadcast":
+                    if photo_arr is not None:
+                        ah, aw = photo_arr.shape[:2]
+                        z = 1.0 + 0.09 * (lt / dur)
+                        cw, ch = int(aw / z), int(ah / z)
+                        x0, y0 = (aw - cw) // 2, (ah - ch) // 2
+                        bg_rgb = cv2.resize(photo_arr[y0:y0 + ch, x0:x0 + cw], (w, h), interpolation=cv2.INTER_LINEAR)
+                    else:
+                        bg_rgb = make_dark_gradient_bg(global_t, sl["accent"])
+                    base_rgba = Image.fromarray(bg_rgb).convert("RGBA")
+                    base_rgba.alpha_composite(vignette)
+                    bg_dark = np.array(base_rgba.convert("RGB"), dtype=np.uint8)
 
-                # اعمال سایه سینمایی بالا و پایین روی عکس
-                base_rgba = Image.fromarray(bg_rgb).convert("RGBA")
-                base_rgba.alpha_composite(vignette)
-                bg_darkened = np.array(base_rgba.convert("RGB"), dtype=np.uint8)
+                    c_prog = min(1.0, max(0.0, (lt - 0.12) / 0.55))
+                    dy = int(115 * ((1.0 - c_prog) ** 3))
+                    cur_box = (52, 1235 + dy, w - 52, 1655 + dy)
+                    frame = apply_glass_box(bg_dark, cur_box, radius=34, alpha=0.60)
+                    frame.alpha_composite(sl["card_content"], (cur_box[0], cur_box[1]))
+                    frame.alpha_composite(sl["hud_top"], (0, 0))
+                    draw_progress_bars(frame, s_idx, lt / dur)
+                    draw_rtl_text(ImageDraw.Draw(frame), (w // 2, 1790), "بسته خبری روزانه  |  آخرین خبرهای شیراز و استان فارس", load_font("regular", 26), (200, 208, 222, 200), align="center", shadow=False)
+                    if lt < wipe_dur:
+                        draw_broadcast_wipe(frame, "out", lt / wipe_dur)
+                    elif lt > (dur - wipe_dur):
+                        draw_broadcast_wipe(frame, "in", (lt - (dur - wipe_dur)) / wipe_dur)
 
-                # حرکت نرم بالا آمدن کارت شیشه‌ای تیتر در 0.55 ثانیه اول
-                card_prog = min(1.0, max(0.0, (lt - 0.12) / 0.55))
-                dy = int(115 * ((1.0 - card_prog) ** 3))
-                cur_box = (
-                    card_box_base[0], card_box_base[1] + dy,
-                    card_box_base[2], card_box_base[3] + dy,
-                )
-                frame = apply_glass_box(bg_darkened, cur_box, radius=34, alpha=0.60)
-                frame.alpha_composite(sl["card_content"], (cur_box[0], cur_box[1]))
-                frame.alpha_composite(sl["hud_top"], (0, 0))
-                draw_progress_bars(frame, s_idx, lt / dur)
+                elif style == "split":
+                    canvas_rgb = np.full((h, w, 3), (17, 20, 27), dtype=np.uint8)
+                    if photo_arr is not None:
+                        ah, aw = photo_arr.shape[:2]
+                        z = 1.0 + 0.08 * (lt / dur)
+                        cw, ch = int(aw / z), int(ah / z)
+                        x0, y0 = (aw - cw) // 2, (ah - ch) // 2
+                        canvas_rgb[0:1020, 0:w] = cv2.resize(photo_arr[y0:y0 + ch, x0:x0 + cw], (w, 1020), interpolation=cv2.INTER_LINEAR)
+                    else:
+                        canvas_rgb[0:1020, 0:w] = make_dark_gradient_bg(global_t, sl["accent"])[0:1020, 0:w]
+                    frame = Image.fromarray(canvas_rgb).convert("RGBA")
+                    frame.alpha_composite(sl["static_split"])
+                    # ورود نرم متن از سمت راست
+                    t_prog = min(1.0, lt / 0.45)
+                    dx = int(140 * ((1.0 - t_prog) ** 3))
+                    frame.alpha_composite(sl["text_layer"], (dx, 1150))
+                    draw_progress_bars(frame, s_idx, lt / dur, bar_y=46)
+                    if ticker_strip is not None:
+                        avail = max(1, ticker_strip.width - w)
+                        src_x = avail - (int(global_t * 165) % avail)
+                        frame.alpha_composite(ticker_strip.crop((src_x, 0, src_x + w, 74)), (0, 1792))
+                    if lt < wipe_dur:
+                        draw_broadcast_wipe(frame, "out", lt / wipe_dur)
+                    elif lt > (dur - wipe_dur):
+                        draw_broadcast_wipe(frame, "in", (lt - (dur - wipe_dur)) / wipe_dur)
 
-                # فوتر باریک برند پایین صفحه
-                draw_rtl_text(
-                    ImageDraw.Draw(frame), (w // 2, 1790),
-                    "بسته خبری روزانه  |  آخرین خبرهای ایران و شیراز",
-                    load_font("regular", 26), (200, 208, 222, 200), align="center", shadow=False
-                )
+                elif style == "editorial":
+                    frame = Image.fromarray(paper_bg_arr.copy()).convert("RGBA")
+                    # قاب عکس مطبوعاتی با زوم ملایم
+                    px1, py1, px2, py2 = 66, 246, w - 66, 1020
+                    pw, ph = px2 - px1, py2 - py1
+                    if photo_arr is not None:
+                        ah, aw = photo_arr.shape[:2]
+                        z = 1.0 + 0.07 * (lt / dur)
+                        cw, ch = int(aw / z), int(ah / z)
+                        x0, y0 = (aw - cw) // 2, (ah - ch) // 2
+                        pic_pil = Image.fromarray(cv2.resize(photo_arr[y0:y0 + ch, x0:x0 + cw], (pw, ph), interpolation=cv2.INTER_LINEAR))
+                    else:
+                        pic_pil = Image.fromarray(make_dark_gradient_bg(global_t, sl["accent"])[0:ph, 0:pw])
+                    fd = ImageDraw.Draw(frame)
+                    fd.rectangle([(px1 + 14, py1 + 14), (px2 + 14, py2 + 14)], fill=(8, 9, 12, 190))
+                    frame.paste(pic_pil, (px1, py1))
+                    fd.rectangle([(px1, py1), (px2, py2)], outline=(225, 216, 196, 220), width=4)
+                    frame.alpha_composite(sl["ed_frame"])
+                    # افکت کشیده شدن خط هایلایتر قرمز از راست به چپ زیر تیتر
+                    hl_prog = min(1.0, max(0.0, (lt - 0.30) / 1.10))
+                    n_rects = max(1, len(sl["line_rects"]))
+                    for ri, (rx1, ry1, rx2, ry2) in enumerate(sl["line_rects"]):
+                        local_p = min(1.0, max(0.0, hl_prog * n_rects - ri))
+                        if local_p > 0:
+                            cur_x1 = int(rx2 - (rx2 - rx1) * local_p)
+                            fd.rectangle([(cur_x1, ry1), (rx2, ry2)], fill=sl["accent"] + (210,))
+                    frame.alpha_composite(sl["hl_lay"])
+                    draw_progress_bars(frame, s_idx, lt / dur, bar_y=46)
+                    if lt < 0.22:
+                        fade_a = int(230 * (1.0 - lt / 0.22))
+                        frame.alpha_composite(Image.new("RGBA", (w, h), (16, 18, 24, fade_a)))
+                    elif lt > (dur - 0.22):
+                        fade_a = int(230 * ((lt - (dur - 0.22)) / 0.22))
+                        frame.alpha_composite(Image.new("RGBA", (w, h), (16, 18, 24, fade_a)))
 
-                # ترنزیشن اریب قرمز در ابتدا و انتهای اسلاید
-                if lt < wipe_dur:
-                    draw_broadcast_wipe(frame, "out", lt / wipe_dur)
-                elif lt > (dur - wipe_dur):
-                    draw_broadcast_wipe(frame, "in", (lt - (dur - wipe_dur)) / wipe_dur)
+                elif style == "kinetic":
+                    if photo_arr is not None:
+                        ah, aw = photo_arr.shape[:2]
+                        # زوم ضربه‌ای تند در ۰.۳۵ ثانیه اول
+                        snap = 0.14 * ((1.0 - min(1.0, lt / 0.35)) ** 2)
+                        z = 1.04 + snap + 0.05 * (lt / dur)
+                        cw, ch = int(aw / z), int(ah / z)
+                        x0, y0 = (aw - cw) // 2, (ah - ch) // 2
+                        bg_rgb = cv2.resize(photo_arr[y0:y0 + ch, x0:x0 + cw], (w, h), interpolation=cv2.INTER_LINEAR)
+                    else:
+                        bg_rgb = make_dark_gradient_bg(global_t, sl["accent"])
+                    frame = Image.fromarray(bg_rgb).convert("RGBA")
+                    frame.alpha_composite(vignette)
+                    frame.alpha_composite(sl["k_hud"])
+                    # ورود خط‌به‌خط تیترها با نوار رنگی پشت هر خط
+                    for li, lay in enumerate(sl["line_layers"]):
+                        if lt >= (0.14 + li * 0.22):
+                            frame.alpha_composite(lay)
+                    draw_progress_bars(frame, s_idx, lt / dur, bar_y=44)
+                    # فلش ۲ فریمی کوبنده در تغییر خبر
+                    if lt < 0.08:
+                        frame.alpha_composite(Image.new("RGBA", (w, h), (255, 255, 255, 165)))
+
+                else:  # style == "live" (بولتین زنده تلویزیونی)
+                    bg_rgb = make_dark_gradient_bg(global_t, (24, 58, 128))
+                    frame = Image.fromarray(bg_rgb).convert("RGBA")
+                    # عکس داخل مانیتور میانی با گوشه گرد و زوم آرام
+                    mx1, my1, mx2, my2 = 50, 256, w - 50, 1222
+                    mw, mh = mx2 - mx1, my2 - my1
+                    if photo_arr is not None:
+                        ah, aw = photo_arr.shape[:2]
+                        z = 1.0 + 0.08 * (lt / dur)
+                        cw, ch = int(aw / z), int(ah / z)
+                        x0, y0 = (aw - cw) // 2, (ah - ch) // 2
+                        mon_pil = Image.fromarray(cv2.resize(photo_arr[y0:y0 + ch, x0:x0 + cw], (mw, mh), interpolation=cv2.INTER_LINEAR))
+                    else:
+                        mon_pil = Image.fromarray(make_dark_gradient_bg(global_t * 1.4, sl["accent"])[0:mh, 0:mw])
+                    mmask = Image.new("L", (mw, mh), 0)
+                    ImageDraw.Draw(mmask).rounded_rectangle([(0, 0), (mw, mh)], radius=24, fill=255)
+                    frame.paste(mon_pil, (mx1, my1), mmask)
+                    frame.alpha_composite(sl["live_ov"])
+                    # نقطه قرمز چشمک‌زن LIVE در هدر استودیو
+                    if int(global_t * 3.0) % 2 == 0:
+                        ImageDraw.Draw(frame).ellipse([(66, 138), (90, 162)], fill=(239, 35, 48, 255))
+                    # نوار زیرنویس پیوسته شبکه خبر در پایین بولتین
+                    if ticker_strip is not None:
+                        avail = max(1, ticker_strip.width - w)
+                        src_x = avail - (int(global_t * 170) % avail)
+                        frame.alpha_composite(ticker_strip.crop((src_x, 0, src_x + w, 74)), (0, 1732))
+                    if lt < wipe_dur:
+                        draw_broadcast_wipe(frame, "out", lt / wipe_dur)
+                    elif lt > (dur - wipe_dur):
+                        draw_broadcast_wipe(frame, "in", (lt - (dur - wipe_dur)) / wipe_dur)
 
                 yield np.array(frame.convert("RGB"), dtype=np.uint8)
 
-        # ۳. فریم‌های پایان (2.3 ثانیه)
-        n_out = int(2.3 * fps)
+        # ۳. اسلاید پایانی
+        n_out = int(outro_dur * fps)
         for i in range(n_out):
             lt = i / fps
             global_t += 1.0 / fps
@@ -2558,18 +2794,26 @@ async def send_caption_with_shield(session: aiohttp.ClientSession, chat_id: str,
 
 
 # ==================== اجرای کارهای ویدئویی و پردازشی در پس‌زمینه ====================
-async def run_daily60_job(session: aiohttp.ClientSession, chat_id: str):
+async def run_daily60_job(session: aiohttp.ClientSession, chat_id: str, style_key: str = "broadcast", style_title: str = "برودکست شیشه‌ای"):
     try:
         items_copy = list(DAILY_ITEMS[-8:])
-        mp4 = await asyncio.to_thread(build_daily_summary_reel_sync, items_copy)
-        await send_video_file(session, chat_id, mp4, caption=f"🎨 ریلز جمع‌بندی موشن‌گرافیک پاپ‌آرت ({to_persian_digits(str(len(items_copy)))} خبر) آماده انتشار است!")
+        mp4 = await asyncio.to_thread(build_daily_summary_reel_sync, items_copy, style_key)
+        await send_video_file(
+            session,
+            chat_id,
+            mp4,
+            caption=(
+                f"🎬 ریلز جمع‌بندی سبک «{style_title}» ({to_persian_digits(str(len(items_copy)))} خبر) آماده انتشار است!\n"
+                "💡 خبرها هنوز در صف ذخیره هستند؛ می‌توانید همین خبرها را با سبک‌های دیگر هم خروجی بگیرید."
+            ),
+        )
         headlines_text = "\n".join(f"- {it['headline']}" for it in items_copy)
         cap = await generate_editorial_caption(session, f"جمع‌بندی مهم‌ترین اخبار امروز شیراز و استان فارس:\n{headlines_text}")
         await send_caption_with_shield(session, chat_id, cap)
         if os.path.exists(mp4):
             os.remove(mp4)
     except Exception as e:
-        await send_message(session, chat_id, f"⚠️ خطا در ساخت ریلز پاپ‌آرت:\n{e}", kb_main_menu())
+        await send_message(session, chat_id, f"⚠️ خطا در ساخت ریلز ({style_title}):\n{e}", kb_daily_collect())
 
 
 async def run_incident_job(session: aiohttp.ClientSession, chat_id: str, photo_path: str, news_text: str):
@@ -2791,10 +3035,9 @@ async def handle_message(session: aiohttp.ClientSession, msg: dict):
         await send_message(
             session,
             chat_id,
-            f"🎨 حالت ساخت ریلز جمع‌بندی پاپ‌آرت فعال شد!\n"
+            f"🎬 استودیو ریلز جمع‌بندی ۵ سبکی فعال شد!\n"
             f"📦 تعداد خبرهای فعلی در صف: {cnt} خبر\n\n"
-            "حالا خبرها را (عکس+متن یا فقط متن) یکی‌یکی پشت‌سرهم بفرستید یا فوروارد کنید.\n"
-            f"هر زمان همه خبرها را فرستادید، دکمه «{BTN_BUILD_POPART}» را از منوی پایین بزنید:",
+            "خبرها را (عکس+متن یا فقط متن) یکی‌یکی بفرستید؛ سپس هر کدام از ۵ سبک زیر را از منوی پایین انتخاب کنید تا خروجی بگیرید:",
             kb_daily_collect(),
         )
         return
@@ -2816,18 +3059,18 @@ async def handle_message(session: aiohttp.ClientSession, msg: dict):
         )
         return
 
-    if is_pure_text and text == BTN_BUILD_POPART:
+    if is_pure_text and text in DAILY_STYLE_MAP:
         if not DAILY_ITEMS:
             await send_message(session, chat_id, "⚠️ صف خالی است! ابتدا حداقل یک خبر بفرستید.", kb_daily_collect())
             return
-        USER_STATE.pop(chat_id, None)
+        style_key, style_title = DAILY_STYLE_MAP[text]
         await send_message(
             session,
             chat_id,
-            f"🎨 در حال رندر ریلز موشن‌گرافیک پاپ‌آرت از {to_persian_digits(str(len(DAILY_ITEMS[-8:])))} خبر (حدود ۳۰ ثانیه)...",
-            kb_main_menu(),
+            f"🎬 در حال رندر ریلز جمع‌بندی با سبک «{style_title}» از {to_persian_digits(str(len(DAILY_ITEMS[-8:])))} خبر (حدود ۳۰ ثانیه)...",
+            kb_daily_collect(),
         )
-        spawn_bg_task(run_daily60_job(session, chat_id))
+        spawn_bg_task(run_daily60_job(session, chat_id, style_key, style_title))
         return
 
     if is_pure_text and text == BTN_VIDEO:
@@ -2968,7 +3211,7 @@ async def handle_message(session: aiohttp.ClientSession, msg: dict):
             session,
             chat_id,
             f"✅ خبر شماره {cnt} در صف جمع‌بندی پاپ‌آرت ثبت شد:\n«{raw_hl}»\n\n"
-            f"خبر بعدی را بفرستید یا روی «{BTN_BUILD_POPART}» بزنید.",
+            "خبر بعدی را بفرستید یا یکی از ۵ سبک زیر را برای ساخت ریلز انتخاب کنید.",
             kb_daily_collect(),
         )
         return
