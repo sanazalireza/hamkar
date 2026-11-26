@@ -1983,12 +1983,12 @@ def build_daily_summary_reel_sync(items: list) -> str:
     # برچسب اریب قرمز بالای کارت مقدمه
     idraw.polygon([(340, 566), (760, 566), (732, 636), (312, 636)], fill=(204, 18, 28, 255))
     draw_rtl_text(idraw, (536, 578), "بسته خبری روزانه", load_font("bold", 38), (255, 255, 255, 255), align="center", shadow=False)
-    draw_rtl_text(idraw, (w // 2, 720), "۶۰ ثانیه با اخبار شیراز", load_font("display", 90), (255, 255, 255, 255), align="center")
+    draw_rtl_text(idraw, (w // 2, 720), "۶۰ ثانیه با مهم ترین اخبار امروز", load_font("display", 90), (255, 255, 255, 255), align="center")
     draw_rtl_text(idraw, (w // 2, 875), date_str, load_font("bold", 40), (210, 218, 232, 255), align="center", shadow=False)
     idraw.line([(210, 965), (w - 210, 965)], fill=(255, 255, 255, 55), width=2)
     draw_rtl_text(
         idraw, (w // 2, 1015),
-        f"مرور سریع {to_persian_digits(str(n_news))} مهم‌ترین خبرهای امروز",
+        f" {to_persian_digits(str(n_news))} مهم‌ترین خبرهای امروز",
         load_font("bold", 38), (242, 200, 68, 255), align="center", shadow=False
     )
     draw_rtl_text(idraw, (w // 2, 1140), "@ShirazLastNews", load_font("bold", 36), (205, 212, 224, 255), align="center", shadow=False, is_rtl=False)
@@ -2070,7 +2070,7 @@ def build_daily_summary_reel_sync(items: list) -> str:
     od = ImageDraw.Draw(outro_ov)
     od.rounded_rectangle(outro_box, radius=36, outline=(255, 255, 255, 72), width=3)
     draw_rtl_text(od, (w // 2, 755), BRAND_TITLE_FA, load_font("display", 82), (255, 255, 255, 255), align="center")
-    draw_rtl_text(od, (w // 2, 895), "برای پیگیری لحظه‌ای اخبار شیراز و فارس فالو کنید", load_font("bold", 36), (210, 218, 232, 255), align="center", shadow=False)
+    draw_rtl_text(od, (w // 2, 895), "برای پیگیری لحظه‌ای اخبار ایران و شیراز فالو کنید", load_font("bold", 36), (210, 218, 232, 255), align="center", shadow=False)
     od.rounded_rectangle([(255, 1005), (825, 1115)], radius=24, fill=(204, 18, 28, 255))
     draw_rtl_text(od, (w // 2, 1034), "@ShirazLastNews", load_font("bold", 46), (255, 255, 255, 255), align="center", shadow=False, is_rtl=False)
 
