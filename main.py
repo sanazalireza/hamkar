@@ -8,14 +8,13 @@ import os
 import random
 import re
 import shutil
-import struct
 import subprocess
 import tempfile
 import time
 import wave
 from datetime import datetime, timedelta, timezone
 
-# نصب خودکار موتور فارسی‌نویس (libraqm0) قبل از بارگذاری Pillow بدون نیاز به تغییر bot.yml
+# نصب خودکار موتور فارسی‌نویس (libraqm0) قبل از بارگذاری Pillow
 if not ctypes.util.find_library("raqm") and shutil.which("apt-get"):
     _r = subprocess.run(
         ["sudo", "apt-get", "install", "-y", "-qq", "libraqm0"],
@@ -30,6 +29,7 @@ import aiohttp
 import arabic_reshaper
 import cv2
 import jdatetime
+import numpy as np
 from bidi.algorithm import get_display
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, features
 
@@ -194,8 +194,8 @@ FARS_LOCATIONS = {
     "اوز": (27.7611, 54.0067, 13),
     "پاسارگاد": (30.1942, 53.1670, 13),
     "سروستان": (29.2735, 53.2202, 13),
-    "شیراز": (29.5918, 52.5837, 12),
-    "فارس": (29.5918, 52.5837, 8),
+    "شیراز": (29.5918, 52.5837, 13),
+    "فارس": (29.5918, 52.5837, 9),
 }
 
 # ==================== بانک مناسبت‌های شمسی و سپر ضدشدوبن ====================
@@ -271,6 +271,7 @@ BTN_MAP = "🗺️ ریلز زوم نقشه"
 BTN_AUDIO = "🎙️ ریلز موج صوتی"
 BTN_DAILY60 = "🎬 ریلز جمع‌بندی ۶۰ ثانیه‌ای"
 BTN_VIDEO = "🎞️ استودیو تدوین ویدئو"
+BTN_CLEAN_LOGO = "🧹 حذف واترمارک و لوگو"
 BTN_SHADOWBAN = "🛡️ سپر ضدشدوبن"
 BTN_THEME = "🎨 تغییر تم گرافیکی"
 BTN_OCCASION = "📅 کارت مناسبت امروز"
@@ -280,12 +281,21 @@ BTN_CANCEL = "❌ انصراف و بازگشت"
 BTN_SKIP_PHOTO = "⏭️ بدون عکس گوینده"
 BTN_SAFE_REWRITE = "✨ بازنویسی ایمن آخرین کپشن"
 
+# دکمه‌های انتخاب گوشه حذف واترمارک (مورد ۹)
+BTN_CORNER_TR = "↗️ گوشه بالا راست"
+BTN_CORNER_TL = "↖️ گوشه بالا چپ"
+BTN_CORNER_BR = "↘️ گوشه پایین راست"
+BTN_CORNER_BL = "↙️ گوشه پایین چپ"
+
 CONFIG = {
     "theme": "navy",
-    "use_repo_frame": True,
-    "video_antidup": True,
-    "video_facetrack": True,
-    "video_brand": True,
+    "use_repo_frame": True,    # قاب ۳ باکسه ریلز (reel_frame.png)
+    "use_story_frame": True,   # قاب اختصاصی استوری (story_frame.png)
+    "video_antidup": True,     # اصالت‌سازی و حذف متادیتا
+    "video_facetrack": True,   # ردیابی چهره ۹:۱۶
+    "video_brand": True,       # اند-اسکرین دعوت به فالو
+    "video_ticker": True,      # مورد ۷: نوار زیرنویس متحرک شبکه خبر
+    "video_hook_intro": True,  # مورد ۵: قلاب ۱.۵ ثانیه‌ای شوک در ابتدا
     "auto_shadowban": True,
     "auto_daily_card": True,
     "last_occasion_date": "",
@@ -299,7 +309,7 @@ LAST_CAPTION = {}
 DAILY_ITEMS = []
 BG_TASKS = set()
 TMP_ROOT = tempfile.mkdtemp(prefix="shiraz_studio_")
-# ==================== ابزارهای کمکی، ساخت صدای خبری و اجرای امن FFmpeg ====================
+# ==================== ابزارهای کمکی، صدای اضطراری و اجرای امن FFmpeg ====================
 def run_ffmpeg(cmd: list):
     res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if res.returncode != 0:
@@ -308,33 +318,72 @@ def run_ffmpeg(cmd: list):
         raise RuntimeError(tail)
 
 
-def generate_news_audio_wav(out_path: str, duration_sec: float, mode: str = "news") -> str:
-    """ساخت مستقیم فایل صوتی WAV با پایتون (حذف کامل aevalsrc و رفع قطعی ارور 234 در FFmpeg)."""
+def find_repo_audio(mode: str = "incident") -> str:
+    if mode == "incident":
+        cands = ("incident.mp3", "sounds/incident.mp3", "incident_music.mp3", "sounds/incident_music.mp3")
+    else:
+        cands = ("news.mp3", "sounds/news.mp3", "news_music.mp3", "sounds/news_music.mp3")
+    for p in cands:
+        if os.path.exists(p) and os.path.getsize(p) > 4000:
+            return p
+    return ""
+
+
+def generate_emergency_audio_wav(out_path: str, duration_sec: float, mode: str = "incident") -> str:
+    """ساخت صدای پرقدرت و اضطراری (آژیر واقعی + ضربه شوک ۱.۵ ثانیه اول + تیک‌تاک خبری) با NumPy."""
     sr = 44100
-    n_samples = int(sr * duration_sec)
-    frames = bytearray()
-    two_pi = 2.0 * math.pi
+    n = int(sr * duration_sec)
+    t = np.linspace(0.0, duration_sec, n, endpoint=False, dtype=np.float64)
 
-    for i in range(n_samples):
-        t = i / sr
-        if mode == "incident":
-            pulse = 0.5 + 0.5 * math.sin(two_pi * 2.2 * t)
-            beat = 1.0 if (t % 0.75) > 0.60 else 0.0
-            val = 0.16 * math.sin(two_pi * 75.0 * t) * pulse + 0.05 * math.sin(two_pi * 220.0 * t) * beat
-        else:
-            pulse = 0.5 + 0.5 * math.sin(two_pi * 1.5 * t)
-            beat = 1.0 if (t % 1.2) > 1.05 else 0.0
-            val = 0.11 * math.sin(two_pi * 110.0 * t) * pulse + 0.035 * math.sin(two_pi * 330.0 * t) * beat
+    if mode == "incident":
+        # ۱. ضربه شوک و بوق هشدار فوری در ۱.۵ ثانیه اول (قلاب شوک - مورد ۵)
+        boom_env = np.exp(-t * 4.5) * (t < 1.2)
+        boom = 0.55 * np.sin(2 * np.pi * (95.0 - 45.0 * np.minimum(t, 1.0)) * t) * boom_env
+        alert_beep = 0.28 * np.sin(2 * np.pi * 1040.0 * t) * (
+            ((t >= 0.05) & (t < 0.22)) | ((t >= 0.30) & (t < 0.47)) | ((t >= 0.55) & (t < 0.72))
+        )
 
-        sample = max(-32767, min(32767, int(val * 32767)))
-        frames += struct.pack("<h", sample)
+        # ۲. آژیر اورژانسی رفت‌وبرگشتی واقعی (نوسان فرکانس بین ۵۲۰ تا ۹۲۰ هرتز)
+        siren_phase = 2 * np.pi * (720.0 * t - (200.0 / (2 * np.pi * 1.15)) * np.cos(2 * np.pi * 1.15 * t))
+        siren = 0.19 * (0.75 * np.sin(siren_phase) + 0.25 * np.sin(2.0 * siren_phase))
+        siren *= np.clip((t - 0.5) / 0.6, 0.0, 1.0)
+
+        # ۳. ضربان قلب تند خبری (Breaking News Pulse) + تیک‌تاک تایپ زنده
+        pulse_cycle = np.mod(t, 0.50)
+        kick = 0.32 * np.sin(2 * np.pi * 62.0 * t) * np.exp(-pulse_cycle * 14.0)
+        tick_cycle = np.mod(t, 0.14)
+        type_ticks = 0.11 * np.sin(2 * np.pi * 2400.0 * t) * np.exp(-tick_cycle * 65.0) * ((t >= 1.2) & (t < 5.5))
+
+        signal = boom + alert_beep + siren + kick + type_ticks
+    else:
+        # ریتم رسمی و پرانرژی شبکه خبر برای ریلز نقشه و جمع‌بندی ۶۰ ثانیه‌ای
+        bar = np.mod(t, 0.60)
+        bass = 0.18 * np.sin(2 * np.pi * 92.0 * t) * np.exp(-bar * 6.0)
+        chime_cycle = np.mod(t, 1.20)
+        chime = 0.09 * np.sin(2 * np.pi * 440.0 * t) * np.exp(-chime_cycle * 10.0)
+        pad = 0.06 * np.sin(2 * np.pi * 184.0 * t) * (0.6 + 0.4 * np.sin(2 * np.pi * 0.8 * t))
+        signal = bass + chime + pad
+
+    # فید نرم انتهایی و محدودسازی امن صدا
+    fade_n = min(int(sr * 0.4), n // 4)
+    if fade_n > 0:
+        signal[-fade_n:] *= np.linspace(1.0, 0.0, fade_n)
+    signal = np.tanh(signal) * 0.92
+    pcm = (signal * 32767.0).astype(np.int16)
 
     with wave.open(out_path, "wb") as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)
         wf.setframerate(sr)
-        wf.writeframes(frames)
+        wf.writeframes(pcm.tobytes())
     return out_path
+
+
+def get_audio_track(work_dir: str, duration_sec: float, mode: str = "incident") -> str:
+    repo_mp3 = find_repo_audio(mode)
+    if repo_mp3:
+        return repo_mp3
+    return generate_emergency_audio_wav(os.path.join(work_dir, f"sfx_{mode}.wav"), duration_sec, mode=mode)
 
 
 def get_tehran_now() -> datetime:
@@ -361,27 +410,28 @@ def find_repo_reel_frame() -> str:
         "reel_overlay.png",
         "assets/reel_overlay.png",
         "frame.png",
-        "assets/frame.png",
     ):
         if os.path.exists(path) and os.path.getsize(path) > 1000:
             return path
     return ""
 
 
-def find_repo_incident_frame() -> str:
-    for path in ("incident_frame.png", "assets/incident_frame.png"):
+def find_repo_story_frame() -> str:
+    for path in (
+        "story_frame.png",
+        "assets/story_frame.png",
+        "story_overlay.png",
+        "۰۳_استوری_خبر_فوری_خام.png",
+        "assets/۰۳_استوری_خبر_فوری_خام.png",
+    ):
         if os.path.exists(path) and os.path.getsize(path) > 1000:
             return path
+    # جستجوی خودکار هر فایل PNG در مخزن که کلمه «استوری» یا «story» در نامش باشد
+    for fname in os.listdir("."):
+        low = fname.lower()
+        if low.endswith(".png") and ("story" in low or "استوری" in fname) and os.path.getsize(fname) > 1000:
+            return fname
     return ""
-
-
-def prepare_rgba_frame_1080x1920(src_path: str, work_dir: str) -> str:
-    img = Image.open(src_path).convert("RGBA")
-    if img.size != (1080, 1920):
-        img = img.resize((1080, 1920), Image.Resampling.LANCZOS)
-    out = os.path.join(work_dir, "prepared_repo_frame.png")
-    img.save(out, format="PNG")
-    return out
 
 
 def spawn_bg_task(coro):
@@ -397,6 +447,19 @@ def to_persian_digits(text: str) -> str:
     for i in range(10):
         text = text.replace(en[i], fa[i])
     return text
+
+
+def strip_emojis_for_font(text: str) -> str:
+    """حذف کامل ایموجی‌ها و کاراکترهای غیرقابل چاپ در فونت فارسی برای جلوگیری از مربع خالی []."""
+    if not text:
+        return ""
+    allowed = re.sub(
+        r"[^\u0600-\u06FF\u0750-\u077F\uFB50-\uFDFF\uFE70-\uFEFF\u200c\x20-\x7E«»—–،؛؟\n]",
+        " ",
+        text,
+    )
+    allowed = re.sub(r"[ \t]+", " ", allowed)
+    return allowed.strip()
 
 
 def find_font_path(kind: str = "bold") -> str:
@@ -427,24 +490,28 @@ def find_font_path(kind: str = "bold") -> str:
 
 def load_font(kind: str, size: int) -> ImageFont.FreeTypeFont:
     try:
-        return ImageFont.truetype(find_font_path(kind), size)
+        return ImageFont.truetype(find_font_path(kind), max(12, int(size)))
     except Exception:
         return ImageFont.load_default()
 
 
 def prepare_text_and_kwargs(text: str, is_rtl: bool = True) -> tuple:
-    """وقتی Raqm فعال باشد متن خام فارسی با direction='rtl' رسم می‌شود تا حروف پیوسته و بدون مربع باشند."""
+    clean = strip_emojis_for_font(text)
     if HAS_RAQM:
         if is_rtl:
-            return text, {"direction": "rtl", "language": "fa"}
-        return text, {"direction": "ltr"}
+            return clean, {"direction": "rtl", "language": "fa"}
+        return clean, {"direction": "ltr"}
     if is_rtl:
-        return get_display(arabic_reshaper.reshape(text)), {}
-    return text, {}
+        return get_display(arabic_reshaper.reshape(clean)), {}
+    return clean, {}
 
 
-def wrap_persian_lines(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont, max_width: int, max_lines: int = 4) -> list:
-    words = text.replace("\n", " ").split()
+def wrap_all_words(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont, max_width: int) -> list:
+    """شکستن تمام کلمات بدون حذف حتی یک کلمه از انتهای جمله."""
+    clean = strip_emojis_for_font(text).replace("\n", " ")
+    words = clean.split()
+    if not words:
+        return []
     lines = []
     cur = []
     for w in words:
@@ -456,11 +523,35 @@ def wrap_persian_lines(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.Fre
         else:
             lines.append(" ".join(cur))
             cur = [w]
-            if len(lines) >= max_lines - 1:
-                break
-    if cur and len(lines) < max_lines:
+    if cur:
         lines.append(" ".join(cur))
     return lines
+
+
+def fit_text_in_box(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font_kind: str,
+    max_width: int,
+    max_height: int,
+    max_size: int = 72,
+    min_size: int = 24,
+    max_lines: int = 3,
+    line_spacing: float = 1.32,
+) -> tuple:
+    """تنظیم خودکار سایز فونت تا کل متن بدون بریده شدن، دقیقاً داخل کادر جا بگیرد."""
+    clean = strip_emojis_for_font(text)
+    for sz in range(max_size, min_size - 1, -3):
+        font = load_font(font_kind, sz)
+        lines = wrap_all_words(draw, clean, font, max_width)
+        if not lines:
+            return font, [], int(sz * line_spacing)
+        lh = int(sz * line_spacing)
+        if len(lines) <= max_lines and (len(lines) * lh) <= max_height:
+            return font, lines, lh
+    font = load_font(font_kind, min_size)
+    lines = wrap_all_words(draw, clean, font, max_width)[:max_lines]
+    return font, lines, int(min_size * line_spacing)
 
 
 def draw_rtl_text(
@@ -474,9 +565,10 @@ def draw_rtl_text(
     shadow_offset: int = 4,
     is_rtl: bool = True,
 ):
-    if not text:
+    clean = strip_emojis_for_font(text)
+    if not clean:
         return
-    t_draw, kw = prepare_text_and_kwargs(text, is_rtl=is_rtl)
+    t_draw, kw = prepare_text_and_kwargs(clean, is_rtl=is_rtl)
     bbox = draw.textbbox((0, 0), t_draw, font=font, **kw)
     x, y = xy
     if align == "center":
@@ -490,6 +582,39 @@ def draw_rtl_text(
     draw.text((x, y), t_draw, font=font, fill=fill, **kw)
 
 
+def draw_centered_block_in_box(
+    draw: ImageDraw.ImageDraw,
+    box: tuple,
+    text: str,
+    font_kind: str,
+    fill: tuple,
+    max_size: int = 64,
+    min_size: int = 22,
+    max_lines: int = 3,
+    align: str = "center",
+    pad_x: int = 28,
+    pad_y: int = 12,
+    shadow: bool = False,
+):
+    x1, y1, x2, y2 = box
+    bw = max(40, (x2 - x1) - pad_x * 2)
+    bh = max(30, (y2 - y1) - pad_y * 2)
+    font, lines, lh = fit_text_in_box(draw, text, font_kind, bw, bh, max_size=max_size, min_size=min_size, max_lines=max_lines)
+    if not lines:
+        return
+    total_h = len(lines) * lh
+    cur_y = y1 + ((y2 - y1) - total_h) // 2
+    for ln in lines:
+        if align == "right":
+            ax = x2 - pad_x
+        elif align == "left":
+            ax = x1 + pad_x
+        else:
+            ax = (x1 + x2) // 2
+        draw_rtl_text(draw, (ax, cur_y), ln, font, fill, align=align, shadow=shadow, shadow_offset=3)
+        cur_y += lh
+
+
 def fit_cover(img: Image.Image, target_w: int, target_h: int) -> Image.Image:
     src_w, src_h = img.size
     scale = max(target_w / src_w, target_h / src_h)
@@ -498,6 +623,159 @@ def fit_cover(img: Image.Image, target_w: int, target_h: int) -> Image.Image:
     left = (nw - target_w) // 2
     top = (nh - target_h) // 2
     return resized.crop((left, top, left + target_w, top + target_h))
+
+
+# ==================== اسکنر خودکار باکس‌های قاب ریلز و قاب استوری (مورد ۱) ====================
+def detect_reel_frame_boxes(frame_rgba: Image.Image) -> dict:
+    """تشخیص خودکار باکس قرمز بالا، باکس مشکی تیتر میانی و باکس مشکی پایینی از روی reel_frame.png."""
+    arr = np.array(frame_rgba.resize((1080, 1920), Image.Resampling.LANCZOS))
+    r, g, b, a = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2], arr[:, :, 3]
+
+    # مقادیر کالیبره‌شده پیش‌فرض مطابق reel_frame.png ارسالی
+    boxes = {
+        "red_badge": (80, 140, 382, 234),
+        "title_box": (24, 1008, 1026, 1180),
+        "sub_box": (60, 1430, 1020, 1622),
+    }
+
+    # ۱. تشخیص باکس قرمز بالا
+    red_mask = ((a > 120) & (r > 155) & (g < 85) & (b < 85)).astype(np.uint8) * 255
+    cnts, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    red_top = []
+    for c in cnts:
+        x, y, w, h = cv2.boundingRect(c)
+        if y < 750 and w >= 110 and h >= 40:
+            red_top.append((x, y, x + w, y + h))
+    if red_top:
+        red_top.sort(key=lambda bx: bx[1])
+        boxes["red_badge"] = red_top[0]
+
+    # ۲. تشخیص باکس‌های مشکی میانی و پایینی (خط قرمز کنار باکس خودکار حذف می‌شود)
+    dark_mask = ((a > 120) & (r < 68) & (g < 68) & (b < 68)).astype(np.uint8) * 255
+    cnts_d, _ = cv2.findContours(dark_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    dark_boxes = []
+    for c in cnts_d:
+        x, y, w, h = cv2.boundingRect(c)
+        if w >= 450 and h >= 70 and y >= 450:
+            dark_boxes.append((x, y, x + w, y + h))
+    dark_boxes.sort(key=lambda bx: bx[1])
+    if len(dark_boxes) >= 2:
+        boxes["title_box"] = dark_boxes[0]
+        boxes["sub_box"] = dark_boxes[1]
+    elif len(dark_boxes) == 1:
+        boxes["title_box"] = dark_boxes[0]
+
+    return boxes
+
+
+def render_reel_frame_overlay(frame_path: str, badge: str, headline: str, subtitle: str, work_dir: str) -> str:
+    """چاپ تمیز هر ۳ متن (برچسب قرمز، تیتر اصلی، زیرتیتر) دقیقاً داخل ۳ باکس reel_frame.png."""
+    frame = Image.open(frame_path).convert("RGBA").resize((1080, 1920), Image.Resampling.LANCZOS)
+    boxes = detect_reel_frame_boxes(frame)
+    draw = ImageDraw.Draw(frame)
+
+    # باکس ۱ (کادر قرمز بالا): برچسب مثل «خبر فوری»
+    draw_centered_block_in_box(
+        draw,
+        boxes["red_badge"],
+        badge or "خبر فوری",
+        font_kind="display",
+        fill=(255, 255, 255, 255),
+        max_size=44,
+        min_size=24,
+        max_lines=1,
+        align="center",
+        pad_x=16,
+        pad_y=8,
+    )
+
+    # باکس ۲ (کادر مشکی میانی): تیتر اصلی خبر
+    draw_centered_block_in_box(
+        draw,
+        boxes["title_box"],
+        headline or BRAND_TITLE_FA,
+        font_kind="display",
+        fill=(255, 255, 255, 255),
+        max_size=56,
+        min_size=26,
+        max_lines=2,
+        align="right",
+        pad_x=30,
+        pad_y=12,
+        shadow=True,
+    )
+
+    # باکس ۳ (کادر مشکی پایینی): خلاصه / زیرتیتر تکمیلی
+    sub_text = subtitle.strip() if subtitle and subtitle.strip() else f"پوشش لحظه‌ای اخبار شیراز و فارس | {BRAND_HANDLE}"
+    draw_centered_block_in_box(
+        draw,
+        boxes["sub_box"],
+        sub_text,
+        font_kind="bold",
+        fill=(235, 240, 248, 255),
+        max_size=38,
+        min_size=22,
+        max_lines=3,
+        align="center",
+        pad_x=32,
+        pad_y=14,
+    )
+
+    out_p = os.path.join(work_dir, f"filled_reel_frame_{int(time.time()*1000)}.png")
+    frame.save(out_p, format="PNG")
+    return out_p
+
+
+def detect_story_frame_boxes(frame_rgb: Image.Image) -> dict:
+    """تشخیص خودکار ۴ بخش قاب استوری پیج (نوار قرمز بالا، کادر عکس، کارت سفید پایین و برچسب قرمز پایین)."""
+    arr = np.array(frame_rgb.resize((1080, 1920), Image.Resampling.LANCZOS))
+    r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
+
+    # مقادیر دقیق کالیبره‌شده بر اساس ۰۳_استوری_خبر_فوری_خام.png
+    boxes = {
+        "top_red": (60, 120, 1020, 240),
+        "photo_box": (60, 282, 1020, 1218),
+        "white_box": (60, 1262, 1020, 1752),
+        "bottom_red": (840, 1638, 972, 1702),
+    }
+
+    # ۱. تشخیص بخش‌های قرمز (بالا و برچسب کوچک پایین)
+    red_mask = ((r > 155) & (g < 85) & (b < 85)).astype(np.uint8) * 255
+    cnts_r, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for c in cnts_r:
+        x, y, w, h = cv2.boundingRect(c)
+        if y < 500 and w > 400 and h > 40:
+            boxes["top_red"] = (x, y, x + w, y + h)
+        elif y > 1200 and w >= 70 and h >= 30:
+            boxes["bottom_red"] = (x, y, x + w, y + h)
+
+    # ۲. تشخیص کادر طوسی تیره محل قرارگیری عکس خبر
+    gray_mask = ((r >= 15) & (r <= 80) & (g >= 15) & (g <= 85) & (b >= 15) & (b <= 95)).astype(np.uint8) * 255
+    cnts_g, _ = cv2.findContours(gray_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best_g = None
+    best_area = 0
+    for c in cnts_g:
+        x, y, w, h = cv2.boundingRect(c)
+        if w > 500 and h > 400 and (w * h) > best_area:
+            best_area = w * h
+            best_g = (x, y, x + w, y + h)
+    if best_g:
+        boxes["photo_box"] = best_g
+
+    # ۳. تشخیص کارت سفید پایین برای تیتر و خلاصه
+    white_mask = ((r > 210) & (g > 210) & (b > 210)).astype(np.uint8) * 255
+    cnts_w, _ = cv2.findContours(white_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best_w = None
+    best_w_area = 0
+    for c in cnts_w:
+        x, y, w, h = cv2.boundingRect(c)
+        if w > 500 and h > 220 and y > 900 and (w * h) > best_w_area:
+            best_w_area = w * h
+            best_w = (x, y, x + w, y + h)
+    if best_w:
+        boxes["white_box"] = best_w
+
+    return boxes
 
 
 def clean_caption_markdown(text: str) -> str:
@@ -511,7 +789,7 @@ def check_shadowban_words(text: str) -> list:
 
 
 def add_to_daily_items(headline: str, photo_path: str = None, tag: str = "خبر"):
-    clean_hl = headline.replace("⭕", "").strip()
+    clean_hl = strip_emojis_for_font(headline)
     if "|" in clean_hl:
         clean_hl = clean_hl.split("|", 1)[1].strip()
     saved_img = None
@@ -524,7 +802,7 @@ def add_to_daily_items(headline: str, photo_path: str = None, tag: str = "خبر
     DAILY_ITEMS.append({
         "headline": clean_hl[:110],
         "photo": saved_img,
-        "tag": tag,
+        "tag": strip_emojis_for_font(tag) or "شیراز",
         "time": get_tehran_now().strftime("%H:%M"),
     })
     if len(DAILY_ITEMS) > 10:
@@ -536,7 +814,7 @@ def add_to_daily_items(headline: str, photo_path: str = None, tag: str = "خبر
                 pass
 
 
-# ==================== کیبوردهای ثابت منوی پایین صفحه (Reply Keyboard) ====================
+# ==================== کیبوردهای ثابت منوی پایین صفحه ====================
 def kb_main_menu() -> dict:
     return {
         "keyboard": [
@@ -545,7 +823,7 @@ def kb_main_menu() -> dict:
             [{"text": BTN_CAPTION}],
             [{"text": BTN_MAP}, {"text": BTN_AUDIO}],
             [{"text": BTN_DAILY60}],
-            [{"text": BTN_VIDEO}],
+            [{"text": BTN_VIDEO}, {"text": BTN_CLEAN_LOGO}],
             [{"text": BTN_SHADOWBAN}, {"text": BTN_THEME}],
             [{"text": BTN_OCCASION}, {"text": BTN_STATUS}],
         ],
@@ -580,10 +858,22 @@ def kb_video_studio() -> dict:
 
     return {
         "keyboard": [
-            [{"text": f"🖼️ قاب ریلز مخزن: {st(CONFIG['use_repo_frame'])}"}],
-            [{"text": f"🧬 اصالت‌سازی و حذف متادیتا: {st(CONFIG['video_antidup'])}"}],
-            [{"text": f"👤 ردیابی چهره ۹:۱۶: {st(CONFIG['video_facetrack'])}"}],
-            [{"text": f"🏷️ اند-اسکرین دعوت به فالو: {st(CONFIG['video_brand'])}"}],
+            [{"text": f"🖼️ قاب ریلز (reel_frame): {st(CONFIG['use_repo_frame'])}"}, {"text": f"📱 قاب استوری: {st(CONFIG['use_story_frame'])}"}],
+            [{"text": f"⚡ قلاب شوک اول ویدئو: {st(CONFIG['video_hook_intro'])}"}, {"text": f"📰 زیرنویس متحرک خبر: {st(CONFIG['video_ticker'])}"}],
+            [{"text": f"🧬 اصالت‌سازی: {st(CONFIG['video_antidup'])}"}, {"text": f"👤 ردیابی چهره: {st(CONFIG['video_facetrack'])}"}],
+            [{"text": f"🏷️ اند-اسکرین فالو: {st(CONFIG['video_brand'])}"}],
+            [{"text": BTN_BACK}],
+        ],
+        "resize_keyboard": True,
+        "is_persistent": True,
+    }
+
+
+def kb_logo_corners() -> dict:
+    return {
+        "keyboard": [
+            [{"text": BTN_CORNER_TL}, {"text": BTN_CORNER_TR}],
+            [{"text": BTN_CORNER_BL}, {"text": BTN_CORNER_BR}],
             [{"text": BTN_BACK}],
         ],
         "resize_keyboard": True,
@@ -606,27 +896,29 @@ def build_status_text() -> str:
     now_str = to_persian_digits(get_tehran_now().strftime("%H:%M"))
     t_name = THEMES[CONFIG["theme"]]["name"]
     ai_status = "متصل ✅" if GEMINI_API_KEY else "کلید GEMINI_API_KEY ثبت نشده ⚠️"
-    raqm_status = "فعال ✅ (فونت فارسی سالم)" if HAS_RAQM else "حالت پشتیبان"
+    raqm_status = "فعال ✅" if HAS_RAQM else "پشتیبان"
 
-    repo_fr = find_repo_reel_frame()
-    if repo_fr:
-        fr_status = f"فعال ✅ ({os.path.basename(repo_fr)})" if CONFIG["use_repo_frame"] else f"موجود ولی خاموش ⏸ ({os.path.basename(repo_fr)})"
-    else:
-        fr_status = "آپلود نشده (نام فایل: reel_frame.png)"
+    r_fr = find_repo_reel_frame()
+    s_fr = find_repo_story_frame()
+    inc_mp3 = find_repo_audio("incident")
+
+    r_st = f"فعال ✅ ({os.path.basename(r_fr)})" if r_fr else "آپلود نشده (reel_frame.png)"
+    s_st = f"فعال ✅ ({os.path.basename(s_fr)})" if s_fr else "آپلود نشده (story_frame.png)"
+    a_st = f"موزیک اختصاصی ({os.path.basename(inc_mp3)})" if inc_mp3 else "آژیر اورژانسی داخلی ✅"
 
     return (
         f"🎬 استودیوی تولید محتوای {BRAND_HANDLE}\n\n"
-        f"🕒 ساعت تهران: {now_str}\n"
-        f"🎨 تم فعال: {t_name}\n"
-        f"🖼️ قاب ریلز مخزن: {fr_status}\n"
-        f"🔤 موتور فارسی‌نویس: {raqm_status}\n"
-        f"🧠 هوش مصنوعی سردبیری: {ai_status}\n"
-        f"📦 خبرهای صف جمع‌بندی ۶۰ ثانیه‌ای امروز: {to_persian_digits(str(len(DAILY_ITEMS)))} مورد\n\n"
-        "از دکمه‌های منوی پایین صفحه، ابزار موردنظر را انتخاب کنید:"
+        f"🕒 ساعت تهران: {now_str} | 🎨 {t_name}\n"
+        f"🖼️ قاب ریلز ۳ باکسه: {r_st}\n"
+        f"📱 قاب استوری پیج: {s_st}\n"
+        f"🚨 صدای ریلز حادثه‌ای: {a_st}\n"
+        f"🔤 فارسی‌نویس: {raqm_status} | 🧠 هوش مصنوعی: {ai_status}\n"
+        f"📦 صف جمع‌بندی ۶۰ ثانیه‌ای امروز: {to_persian_digits(str(len(DAILY_ITEMS)))} خبر\n\n"
+        "از منوی پایین صفحه، ابزار موردنظر را انتخاب کنید:"
     )
 
 
-# ==================== ارتباط با Telegram API ====================
+# ==================== ارتباط با Telegram API و ذخیره تنظیمات ====================
 async def tg_api(session: aiohttp.ClientSession, method: str, payload: dict):
     if not BOT_TOKEN:
         return None
@@ -692,7 +984,6 @@ async def download_tg_file(session: aiohttp.ClientSession, file_id: str, ext: st
     return out_path
 
 
-# ==================== ذخیره و بازیابی تنظیمات در پیام پین‌شده ====================
 async def load_config_from_pin(session: aiohttp.ClientSession):
     global CONFIG_MSG_ID
     if not ADMIN_ID:
@@ -850,7 +1141,7 @@ async def generate_editorial_caption(
     if res:
         return res
 
-    hl = (news_text.splitlines()[0] if news_text else "گزارش خبری جدید")[:70]
+    hl = strip_emojis_for_font(news_text.splitlines()[0] if news_text else "گزارش خبری جدید")[:70]
     prefix = "⭕ فوری |" if force_incident else "⭕ خبر شیراز |"
     return (
         f"{prefix} {hl}\n\n"
@@ -862,26 +1153,31 @@ async def generate_editorial_caption(
     )
 
 
-async def extract_short_headline(session: aiohttp.ClientSession, news_text: str, is_incident: bool = False) -> tuple:
-    if GEMINI_API_KEY and news_text:
+async def extract_news_parts(session: aiohttp.ClientSession, news_text: str, is_incident: bool = False) -> tuple:
+    """استخراج دقیق ۳ بخش بدون ایموجی برای پر کردن هر ۳ باکس قاب ریلز و قاب استوری: (برچسب، تیتر کوتاه، زیرتیتر تکمیلی)."""
+    clean_input = strip_emojis_for_font(news_text)
+    if GEMINI_API_KEY and clean_input:
         p = (
-            "از متن خبر زیر فقط یک تیتر بسیار کوتاه و کوبنده (حداکثر ۸ کلمه، رسمی و بدون کلیک‌بیت) "
-            "و یک برچسب ۱ یا ۲ کلمه‌ای (مثل فوری، حادثه، خبر شیراز، اقتصادی، ورزشی) استخراج کن.\n"
-            "خروجی را دقیقاً در دو خط بده:\n"
-            "خط اول: فقط برچسب\n"
-            "خط دوم: فقط تیتر\n\n"
-            f"متن خبر:\n{news_text}"
+            "از خبر زیر دقیقاً ۳ خط بدون هیچ ایموجی، علامت ستاره یا شماره بساز:\n"
+            "خط ۱: برچسب بسیار کوتاه (۱ تا ۲ کلمه مثل: خبر فوری، حوادث، خبر شیراز، ورزشی، اقتصادی)\n"
+            "خط ۲: تیتر اصلی کامل، رسا و کوتاه (حداکثر ۱۰ کلمه، بدون بریده شدن جمله)\n"
+            "خط ۳: زیرتیتر تکمیلی دقیق در یک جمله کوتاه (حداکثر ۱۶ کلمه)\n\n"
+            f"خبر:\n{clean_input}"
         )
         out = await gemini_generate(session, p)
-        lines = [ln.strip("•-*⭕ ") for ln in out.splitlines() if ln.strip()]
-        if len(lines) >= 2:
-            badge = "فوری | حادثه" if is_incident else lines[0][:22]
-            return badge, lines[1][:85]
+        lines = [strip_emojis_for_font(ln.lstrip("•-*0123456789.: ")) for ln in out.splitlines() if strip_emojis_for_font(ln)]
+        if len(lines) >= 3:
+            badge = "خبر فوری" if is_incident else lines[0][:22]
+            return badge, lines[1][:105], lines[2][:150]
+        if len(lines) == 2:
+            badge = "خبر فوری" if is_incident else lines[0][:22]
+            return badge, lines[1][:105], f"پوشش لحظه‌ای اخبار شیراز و فارس | {BRAND_HANDLE}"
 
-    first_line = (news_text.splitlines()[0] if news_text else BRAND_TITLE_FA).strip()
-    words = first_line.split()[:9]
-    badge = "فوری | حادثه" if is_incident else "خبر شیراز"
-    return badge, " ".join(words)
+    raw_lines = [strip_emojis_for_font(ln) for ln in (news_text or "").splitlines() if strip_emojis_for_font(ln)]
+    hl = raw_lines[0][:100] if raw_lines else BRAND_TITLE_FA
+    sub = raw_lines[1][:145] if len(raw_lines) > 1 else f"پوشش لحظه‌ای اخبار شیراز و فارس | {BRAND_HANDLE}"
+    badge = "خبر فوری" if is_incident else "خبر شیراز"
+    return badge, hl, sub
 
 
 async def rewrite_shadowban_safe(session: aiohttp.ClientSession, caption_text: str) -> str:
@@ -898,14 +1194,180 @@ async def rewrite_shadowban_safe(session: aiohttp.ClientSession, caption_text: s
     )
     res = await gemini_generate(session, p)
     return res or caption_text
-    # ==================== ۱. کارت‌ساز پست (۴:۵) و استوری (۹:۱۶) ====================
+    # ==================== نوار زیرنویس متحرک شبکه خبر (مورد ۷) ====================
+def build_scrolling_ticker_strip(text: str, duration_sec: float, bg_color=(185, 28, 28, 240), text_color=(255, 255, 255, 255), height: int = 74) -> Image.Image:
+    """ساخت نوار زیرنویس پیوسته فارسی برای حرکت روان از چپ به راست (خوانش طبیعی فارسی)."""
+    clean = strip_emojis_for_font(text) or f"{BRAND_TITLE_FA} — پوشش لحظه‌ای اخبار شیراز و استان فارس"
+    item = f"   ●   {clean}   ●   {BRAND_TITLE_FA} ({BRAND_HANDLE})"
+    font = load_font("bold", 34)
+
+    probe = Image.new("RGBA", (10, 10), (0, 0, 0, 0))
+    pd = ImageDraw.Draw(probe)
+    t_draw, kw = prepare_text_and_kwargs(item, is_rtl=True)
+    bb = pd.textbbox((0, 0), t_draw, font=font, **kw)
+    unit_w = max(420, (bb[2] - bb[0]) + 40)
+
+    needed_w = min(14000, max(2600, int(duration_sec * 175) + 1800))
+    reps = max(2, (needed_w // unit_w) + 2)
+    full_text = item * reps
+    ft_draw, fkw = prepare_text_and_kwargs(full_text, is_rtl=True)
+    fbb = pd.textbbox((0, 0), ft_draw, font=font, **fkw)
+    strip_w = max(needed_w, (fbb[2] - fbb[0]) + 120)
+
+    strip = Image.new("RGBA", (strip_w, height), bg_color)
+    sd = ImageDraw.Draw(strip)
+    sd.rectangle([(0, 0), (strip_w, 4)], fill=(250, 204, 21, 255))
+    sd.rectangle([(0, height - 4), (strip_w, height)], fill=(250, 204, 21, 255))
+
+    ty = (height - (fbb[3] - fbb[1])) // 2 - fbb[1]
+    sd.text((strip_w - 40 - fbb[2], ty), ft_draw, font=font, fill=text_color, **fkw)
+    return strip
+
+
+def pipe_frames_to_mp4(frame_generator, out_mp4: str, audio_path: str, fps: int = 25):
+    """ارسال مستقیم فریم‌های تصویر به FFmpeg با سرعت بالا و بدون خطاهای پیچیده فیلتر (حذف کامل ارور ۲۳۴)."""
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "rawvideo", "-vcodec", "rawvideo",
+        "-pix_fmt", "rgb24", "-s", "1080x1920", "-r", str(fps),
+        "-i", "-",
+        "-i", audio_path,
+        "-map", "0:v:0", "-map", "1:a:0",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-ar", "44100", "-ac", "2", "-b:a", "128k",
+        "-shortest", "-map_metadata", "-1", "-movflags", "+faststart",
+        out_mp4,
+    ]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    try:
+        for frame_rgb in frame_generator:
+            proc.stdin.write(frame_rgb.tobytes())
+    finally:
+        if proc.stdin:
+            proc.stdin.close()
+    _, err = proc.communicate()
+    if proc.returncode != 0:
+        err_txt = err.decode("utf-8", errors="ignore")
+        lines = [ln.strip() for ln in err_txt.splitlines() if ln.strip()]
+        raise RuntimeError("\n".join(lines[-4:]) if lines else f"ffmpeg exit {proc.returncode}")
+
+
+# ==================== ۱. کارت‌ساز پست و استوری (با پشتیبانی خودکار از قاب استوری پیج) ====================
+def render_story_with_repo_frame_sync(story_frame_path: str, photo_path: str, badge: str, headline: str, subtext: str) -> str:
+    """طراحی استوری دقیقاً روی قاب اختصاصی پیج (۰۳_استوری_خبر_فوری_خام.png / story_frame.png)."""
+    base = Image.open(story_frame_path).convert("RGB").resize((1080, 1920), Image.Resampling.LANCZOS)
+    boxes = detect_story_frame_boxes(base)
+    canvas = base.convert("RGBA")
+
+    # ۱. قرار دادن عکس خبر با گوشه‌های گرد دقیقاً داخل کادر طوسی میانی
+    px1, py1, px2, py2 = boxes["photo_box"]
+    pw, ph = max(50, px2 - px1), max(50, py2 - py1)
+    if photo_path and os.path.exists(photo_path):
+        pic = fit_cover(Image.open(photo_path).convert("RGB"), pw, ph)
+    else:
+        theme = THEMES.get(CONFIG["theme"], THEMES["navy"])
+        pic = Image.new("RGB", (pw, ph), theme["bg"])
+
+    mask = Image.new("L", (pw, ph), 0)
+    ImageDraw.Draw(mask).rounded_rectangle([(0, 0), (pw, ph)], radius=26, fill=255)
+    canvas.paste(pic, (px1, py1), mask)
+
+    draw = ImageDraw.Draw(canvas)
+
+    # ۲. نوشتن عنوان در نوار قرمز بالای استوری
+    top_title = f"{strip_emojis_for_font(badge) or 'خبر فوری'}  |  {BRAND_TITLE_FA}"
+    draw_centered_block_in_box(
+        draw,
+        boxes["top_red"],
+        top_title,
+        font_kind="display",
+        fill=(255, 255, 255, 255),
+        max_size=50,
+        min_size=26,
+        max_lines=1,
+        align="center",
+        pad_x=24,
+        pad_y=10,
+    )
+
+    # ۳. نوشتن تیتر و زیرتیتر داخل کارت سفید پایین (بالای برچسب قرمز کوچک تا روی هم نیفتند)
+    wx1, wy1, wx2, wy2 = boxes["white_box"]
+    bx1, by1, bx2, by2 = boxes["bottom_red"]
+
+    text_bottom = min(by1 - 18, wy2 - 90)
+    title_area_h = int((text_bottom - (wy1 + 22)) * 0.62)
+    title_box = (wx1 + 28, wy1 + 22, wx2 - 28, wy1 + 22 + title_area_h)
+    sub_box = (wx1 + 28, wy1 + 26 + title_area_h, wx2 - 28, text_bottom)
+
+    draw_centered_block_in_box(
+        draw,
+        title_box,
+        headline or BRAND_TITLE_FA,
+        font_kind="display",
+        fill=(15, 23, 42, 255),
+        max_size=56,
+        min_size=28,
+        max_lines=3,
+        align="right",
+        pad_x=16,
+        pad_y=6,
+    )
+
+    if subtext:
+        draw_centered_block_in_box(
+            draw,
+            sub_box,
+            subtext,
+            font_kind="bold",
+            fill=(71, 85, 105, 255),
+            max_size=32,
+            min_size=22,
+            max_lines=2,
+            align="right",
+            pad_x=16,
+            pad_y=4,
+        )
+
+    # ۴. نوشتن برچسب کوتاه داخل باکس قرمز کوچک پایین راست
+    short_tag = (strip_emojis_for_font(badge).split("|")[0].strip() if badge else "فوری")[:14]
+    draw_centered_block_in_box(
+        draw,
+        boxes["bottom_red"],
+        short_tag or "فوری",
+        font_kind="bold",
+        fill=(255, 255, 255, 255),
+        max_size=30,
+        min_size=18,
+        max_lines=1,
+        align="center",
+        pad_x=8,
+        pad_y=4,
+    )
+
+    # ۵. نوشتن آیدی پیج و تاریخ شمسی در سمت چپ پایین کارت سفید
+    jnow = jdatetime.datetime.fromgregorian(datetime=get_tehran_now())
+    date_str = to_persian_digits(f"{jnow.day} {JALALI_MONTHS[jnow.month]} {jnow.year}")
+    mid_y = by1 + ((by2 - by1) - 30) // 2
+    draw_rtl_text(draw, (wx1 + 42, mid_y), BRAND_HANDLE, load_font("bold", 30), (15, 23, 42, 255), align="left", shadow=False, is_rtl=False)
+    draw_rtl_text(draw, (bx1 - 24, mid_y), date_str, load_font("regular", 26), (100, 116, 139, 255), align="right", shadow=False)
+
+    out_path = os.path.join(TMP_ROOT, f"story_custom_{int(time.time()*1000)}.jpg")
+    canvas.convert("RGB").save(out_path, quality=94)
+    return out_path
+
+
 def render_news_card_sync(photo_path: str, badge: str, headline: str, subtext: str, fmt: str = "post", theme_key: str = "navy") -> str:
+    # اگر استوری است و قاب اختصاصی استوری در مخزن موجود است، مستقیماً روی آن ساخته می‌شود
+    if fmt == "story" and CONFIG.get("use_story_frame", True):
+        s_frame = find_repo_story_frame()
+        if s_frame:
+            return render_story_with_repo_frame_sync(s_frame, photo_path, badge, headline, subtext)
+
     theme = THEMES.get(theme_key, THEMES["navy"])
     w, h = (1080, 1350) if fmt == "post" else (1080, 1920)
 
     if photo_path and os.path.exists(photo_path):
-        base = Image.open(photo_path).convert("RGB")
-        canvas = fit_cover(base, w, h).convert("RGBA")
+        canvas = fit_cover(Image.open(photo_path).convert("RGB"), w, h).convert("RGBA")
     else:
         canvas = Image.new("RGBA", (w, h), theme["bg"] + (255,))
 
@@ -914,45 +1376,46 @@ def render_news_card_sync(photo_path: str, badge: str, headline: str, subtext: s
     bg_r, bg_g, bg_b = theme["bg"]
 
     for y in range(260):
-        alpha = int(190 * (1 - y / 260))
-        gdraw.line([(0, y), (w, y)], fill=(bg_r, bg_g, bg_b, alpha))
+        gdraw.line([(0, y), (w, y)], fill=(bg_r, bg_g, bg_b, int(195 * (1 - y / 260))))
 
-    bottom_start = int(h * 0.42)
+    bottom_start = int(h * 0.40)
     for y in range(bottom_start, h):
         ratio = (y - bottom_start) / (h - bottom_start)
-        alpha = int(248 * (ratio ** 1.35))
-        gdraw.line([(0, y), (w, y)], fill=(bg_r, bg_g, bg_b, alpha))
+        gdraw.line([(0, y), (w, y)], fill=(bg_r, bg_g, bg_b, int(250 * (ratio ** 1.3))))
 
     canvas = Image.alpha_composite(canvas, grad)
     draw = ImageDraw.Draw(canvas)
-
     draw.rectangle([(0, 0), (w, 16)], fill=theme["accent"] + (255,))
 
-    f_brand = load_font("bold", 34)
-    f_handle = load_font("regular", 28)
     jnow = jdatetime.datetime.fromgregorian(datetime=get_tehran_now())
     date_str = to_persian_digits(f"{jnow.day} {JALALI_MONTHS[jnow.month]} {jnow.year}")
 
-    draw_rtl_text(draw, (w - 54, 46), BRAND_TITLE_FA, f_brand, theme["text"] + (255,), align="right")
-    draw_rtl_text(draw, (54, 52), BRAND_HANDLE, f_handle, theme["accent"] + (255,), align="left", shadow=False, is_rtl=False)
+    draw_rtl_text(draw, (w - 54, 46), BRAND_TITLE_FA, load_font("bold", 34), theme["text"] + (255,), align="right")
+    draw_rtl_text(draw, (54, 52), BRAND_HANDLE, load_font("regular", 28), theme["accent"] + (255,), align="left", shadow=False, is_rtl=False)
     draw_rtl_text(draw, (w - 54, 96), date_str, load_font("regular", 24), theme["subtext"] + (230,), align="right", shadow=False)
 
+    # تنظیم خودکار سایز تیتر تا هیچ کلمه‌ای بریده نشود
+    max_title_h = 330 if fmt == "story" else 270
+    f_title, lines, line_h = fit_text_in_box(
+        draw, headline, "display", w - 130, max_title_h,
+        max_size=74 if fmt == "story" else 66, min_size=34, max_lines=4
+    )
+    block_h = max(line_h, len(lines) * line_h)
+
+    sub_h = 110 if subtext else 0
+    title_start_y = (h - 210 - sub_h - block_h) if fmt == "post" else (h - 320 - sub_h - block_h)
+
+    # برچسب رنگی بالای تیتر
     f_badge = load_font("bold", 34)
-    b_txt, b_kw = prepare_text_and_kwargs(badge, is_rtl=True)
+    clean_badge = strip_emojis_for_font(badge) or "خبر شیراز"
+    b_txt, b_kw = prepare_text_and_kwargs(clean_badge, is_rtl=True)
     bb = draw.textbbox((0, 0), b_txt, font=f_badge, **b_kw)
     bw = (bb[2] - bb[0]) + 56
     bh = 62
-
-    f_title = load_font("display", 78 if fmt == "story" else 70)
-    lines = wrap_persian_lines(draw, headline, f_title, w - 120, max_lines=3)
-    line_h = 104 if fmt == "story" else 94
-    block_h = len(lines) * line_h
-
-    title_start_y = h - 245 - block_h if fmt == "post" else h - 380 - block_h
-    badge_y = title_start_y - bh - 28
+    badge_y = title_start_y - bh - 26
 
     draw.rounded_rectangle([(w - 56 - bw, badge_y), (w - 56, badge_y + bh)], radius=12, fill=theme["badge_bg"] + (255,))
-    draw_rtl_text(draw, (w - 56 - bw // 2, badge_y + 10), badge, f_badge, theme["badge_text"] + (255,), align="center", shadow=False)
+    draw_rtl_text(draw, (w - 56 - bw // 2, badge_y + 10), clean_badge, f_badge, theme["badge_text"] + (255,), align="center", shadow=False)
     draw.rectangle([(w - 42, title_start_y + 8), (w - 30, title_start_y + block_h - 10)], fill=theme["accent"] + (255,))
 
     cur_y = title_start_y
@@ -961,12 +1424,11 @@ def render_news_card_sync(photo_path: str, badge: str, headline: str, subtext: s
         cur_y += line_h
 
     if subtext:
-        f_sub = load_font("regular", 31)
-        sub_lines = wrap_persian_lines(draw, subtext, f_sub, w - 120, max_lines=2)
-        sy = cur_y + 16
-        for sl in sub_lines:
-            draw_rtl_text(draw, (w - 64, sy), sl, f_sub, theme["subtext"] + (240,), align="right", shadow=False)
-            sy += 46
+        sub_box = (60, cur_y + 12, w - 64, cur_y + 115)
+        draw_centered_block_in_box(
+            draw, sub_box, subtext, "regular", theme["subtext"] + (240,),
+            max_size=30, min_size=22, max_lines=2, align="right", pad_x=0, pad_y=2
+        )
 
     footer_y = h - 88 if fmt == "post" else h - 140
     draw.line([(54, footer_y - 18), (w - 54, footer_y - 18)], fill=theme["accent"] + (130,), width=2)
@@ -978,244 +1440,360 @@ def render_news_card_sync(photo_path: str, badge: str, headline: str, subtext: s
     return out_path
 
 
-# ==================== ۲. ریلز فوری و حادثه‌ای (قالب اضطراری کاملاً متمایز) ====================
-def build_incident_reel_sync(photo_path: str, headline: str, location_or_sub: str = "") -> str:
-    w, h = 1080, 1920
+# ==================== ۲. ریلز فوری و حادثه‌ای بازطراحی‌شده (شوک + آژیر + تایپ زنده + زیرنویس شبکه خبر) ====================
+def build_incident_reel_sync(photo_path: str, headline: str, subtext: str = "") -> str:
+    """ریلز اضطراری ۱۲ ثانیه‌ای: قلاب ۱.۵ ثانیه شوک، لرزش دوربین، چراغ گردان آژیر، تایپ زنده تیتر و نوار زیرنویس شبکه خبر."""
+    w, h, fps, duration = 1080, 1920, 25, 12.0
+    total_frames = int(fps * duration)
     work_dir = tempfile.mkdtemp(dir=TMP_ROOT)
 
-    bg_path = os.path.join(work_dir, "bg.jpg")
+    # پس‌زمینه حادثه‌ای با کنتراست سینمایی بالا
     if photo_path and os.path.exists(photo_path):
-        im = fit_cover(Image.open(photo_path).convert("RGB"), 1200, 2134)
+        bg_big = fit_cover(Image.open(photo_path).convert("RGB"), 1260, 2240)
     else:
-        im = Image.new("RGB", (1200, 2134), (20, 10, 12))
-    im.save(bg_path, quality=92)
+        bg_big = Image.new("RGB", (1260, 2240), (24, 10, 14))
+    bg_arr = np.array(bg_big, dtype=np.uint8)
 
-    def make_siren_glow(left_color, right_color, out_name):
-        layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-        d = ImageDraw.Draw(layer)
-        d.ellipse([(-260, -180), (540, 620)], fill=left_color + (165,))
-        d.ellipse([(w - 540, -180), (w + 260, 620)], fill=right_color + (165,))
-        d.rectangle([(0, 0), (38, h)], fill=left_color + (100,))
-        d.rectangle([(w - 38, 0), (w, h)], fill=right_color + (100,))
-        layer = layer.filter(ImageFilter.GaussianBlur(radius=95))
-        p = os.path.join(work_dir, out_name)
-        layer.save(p)
-        return p
+    # دو فریم نور چراغ گردان قرمز و آبی بسیار پرقدرت
+    def make_siren_layer(c_left, c_right):
+        lay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        d = ImageDraw.Draw(lay)
+        d.ellipse([(-280, -200), (620, 720)], fill=c_left + (200,))
+        d.ellipse([(w - 620, -200), (w + 280, 720)], fill=c_right + (200,))
+        d.rectangle([(0, 0), (46, h)], fill=c_left + (145,))
+        d.rectangle([(w - 46, 0), (w, h)], fill=c_right + (145,))
+        d.rectangle([(0, h - 500), (w, h)], fill=(185, 20, 35, 90))
+        return lay.filter(ImageFilter.GaussianBlur(radius=85))
 
-    glow_a = make_siren_glow((239, 35, 60), (37, 99, 235), "glow_a.png")
-    glow_b = make_siren_glow((37, 99, 235), (239, 35, 60), "glow_b.png")
+    siren_a = make_siren_layer((239, 25, 45), (29, 78, 216))
+    siren_b = make_siren_layer((29, 78, 216), (239, 25, 45))
 
-    ov = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    od = ImageDraw.Draw(ov)
+    # فریم شوک ۱.۵ ثانیه اول (Hook Flash Intro - مورد ۵)
+    shock_red = Image.new("RGBA", (w, h), (210, 20, 32, 200))
+    sd = ImageDraw.Draw(shock_red)
+    sd.rounded_rectangle([(90, 740), (w - 90, 1140)], radius=28, fill=(10, 10, 14, 240), outline=(250, 204, 21, 255), width=8)
+    draw_rtl_text(sd, (w // 2, 795), "خبر فوری", load_font("display", 120), (250, 204, 21, 255), align="center")
+    draw_rtl_text(sd, (w // 2, 970), "گزارش اضطراری حادثه", load_font("bold", 54), (255, 255, 255, 255), align="center")
 
-    for y in range(420):
-        od.line([(0, y), (w, y)], fill=(8, 8, 12, int(235 * (1 - y / 420))))
-    for y in range(960, h):
-        r = (y - 960) / (h - 960)
-        od.line([(0, y), (w, y)], fill=(10, 6, 8, int(252 * (r ** 1.15))))
+    shock_white = Image.new("RGBA", (w, h), (255, 255, 255, 215))
 
-    def draw_hazard_stripe(y_top, height, color1, color2=(12, 12, 14, 255)):
-        od.rectangle([(0, y_top), (w, y_top + height)], fill=color2)
-        step = 54
-        for x in range(-height, w + step, step):
-            poly = [(x, y_top + height), (x + 26, y_top + height), (x + 26 + height, y_top), (x + height, y_top)]
-            od.polygon(poly, fill=color1)
+    # لایه ثابت گرافیک اضطراری (نوارهای خطر، ساعت وقوع، کادر تیتر، برند)
+    static_ov = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    od = ImageDraw.Draw(static_ov)
 
-    draw_hazard_stripe(0, 28, (220, 38, 38, 255))
-    draw_hazard_stripe(h - 28, 28, (250, 204, 21, 255))
+    for y in range(440):
+        od.line([(0, y), (w, y)], fill=(8, 6, 10, int(238 * (1 - y / 440))))
+    for y in range(900, h):
+        r = (y - 900) / (h - 900)
+        od.line([(0, y), (w, y)], fill=(10, 4, 8, int(252 * (r ** 1.15))))
 
-    od.rounded_rectangle([(w - 445, 118), (w - 48, 206)], radius=12, fill=(220, 38, 38, 250), outline=(250, 204, 21, 255), width=4)
-    draw_rtl_text(od, (w - 246, 134), "فوری | گزارش حادثه", load_font("display", 46), (255, 255, 255, 255), align="center", shadow=False)
+    def draw_hazard_bar(y_top, bh, c1, c2=(14, 14, 18, 255)):
+        od.rectangle([(0, y_top), (w, y_top + bh)], fill=c2)
+        for x in range(-bh, w + 56, 56):
+            od.polygon([(x, y_top + bh), (x + 28, y_top + bh), (x + 28 + bh, y_top), (x + bh, y_top)], fill=c1)
 
+    draw_hazard_bar(0, 32, (230, 30, 40, 255))
+    draw_hazard_bar(h - 32, 32, (250, 204, 21, 255))
+
+    # کادر بالای «فوری | حادثه» با فضای نقطه قرمز چشمک‌زن
+    od.rounded_rectangle([(w - 490, 110), (w - 44, 206)], radius=14, fill=(220, 24, 34, 252), outline=(250, 204, 21, 255), width=5)
+    draw_rtl_text(od, (w - 295, 128), "فوری | حادثه", load_font("display", 52), (255, 255, 255, 255), align="center", shadow=False)
+
+    # ساعت زنده وقوع
     now_t = to_persian_digits(get_tehran_now().strftime("%H:%M"))
-    od.rounded_rectangle([(48, 124), (295, 200)], radius=10, fill=(15, 15, 20, 225), outline=(220, 38, 38, 255), width=3)
-    draw_rtl_text(od, (171, 140), f"ساعت {now_t}", load_font("bold", 32), (250, 204, 21, 255), align="center", shadow=False)
+    od.rounded_rectangle([(44, 118), (315, 200)], radius=12, fill=(12, 12, 16, 235), outline=(220, 38, 38, 255), width=4)
+    draw_rtl_text(od, (180, 136), f"ساعت {now_t}", load_font("bold", 34), (250, 204, 21, 255), align="center", shadow=False)
 
-    f_title = load_font("display", 82)
-    lines = wrap_persian_lines(od, headline, f_title, w - 150, max_lines=3)
-    line_h = 104
-    box_h = len(lines) * line_h + 75
-    box_top = h - 390 - box_h
+    # جعبه بزرگ تیتر حادثه با حاشیه هشدار قرمز و خط زرد
+    box_top, box_bot = 1150, 1540
+    od.rounded_rectangle([(42, box_top), (w - 42, box_bot)], radius=20, fill=(12, 8, 12, 235), outline=(235, 30, 40, 255), width=6)
+    od.rectangle([(w - 62, box_top + 24), (w - 46, box_bot - 24)], fill=(250, 204, 21, 255))
 
-    od.rounded_rectangle([(46, box_top), (w - 46, box_top + box_h)], radius=18, fill=(14, 10, 12, 228), outline=(220, 38, 38, 255), width=5)
-    od.rectangle([(w - 64, box_top + 22), (w - 50, box_top + box_h - 22)], fill=(250, 204, 21, 255))
+    # برچسب برند بالای نوار زیرنویس
+    draw_rtl_text(od, (w - 50, 1565), BRAND_TITLE_FA, load_font("bold", 32), (250, 204, 21, 255), align="right")
+    draw_rtl_text(od, (50, 1565), BRAND_HANDLE, load_font("bold", 32), (255, 255, 255, 255), align="left", is_rtl=False)
 
-    ty = box_top + 32
-    for ln in lines:
-        draw_rtl_text(od, (w - 86, ty), ln, f_title, (255, 255, 255, 255), align="right", shadow=True, shadow_offset=5)
-        ty += line_h
+    # آماده‌سازی مراحل تایپ زنده تیتر (کلمه‌به‌کلمه - مورد ۶)
+    clean_hl = strip_emojis_for_font(headline) or "حادثه فوری در حال بررسی است"
+    hl_words = clean_hl.split()
+    tw_box = (66, box_top + 26, w - 82, box_bot - 24)
+    probe_d = ImageDraw.Draw(Image.new("RGBA", (w, h)))
+    hl_font, _, hl_lh = fit_text_in_box(probe_d, clean_hl, "display", tw_box[2] - tw_box[0], tw_box[3] - tw_box[1], max_size=76, min_size=36, max_lines=3)
 
-    ticker_y = box_top + box_h + 30
-    od.rectangle([(0, ticker_y), (w, ticker_y + 76)], fill=(185, 28, 28, 245))
-    sub_line = location_or_sub.strip() if location_or_sub else "پوشش فوری حوادث شیراز، فارس و ایران"
-    draw_rtl_text(od, (w // 2, ticker_y + 16), sub_line[:58], load_font("bold", 34), (255, 255, 255, 255), align="center", shadow=False)
-    draw_rtl_text(od, (w - 60, ticker_y + 106), BRAND_TITLE_FA, load_font("bold", 32), (250, 204, 21, 255), align="right")
-    draw_rtl_text(od, (60, ticker_y + 106), BRAND_HANDLE, load_font("bold", 32), (250, 204, 21, 255), align="left", is_rtl=False)
+    type_overlays = []
+    for k in range(1, len(hl_words) + 1):
+        partial = " ".join(hl_words[:k])
+        lay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        ld = ImageDraw.Draw(lay)
+        p_lines = wrap_all_words(ld, partial, hl_font, tw_box[2] - tw_box[0])[:3]
+        tot_h = len(p_lines) * hl_lh
+        cy = tw_box[1] + ((tw_box[3] - tw_box[1]) - tot_h) // 2
+        for ln in p_lines:
+            draw_rtl_text(ld, (tw_box[2], cy), ln, hl_font, (255, 255, 255, 255), align="right", shadow=True, shadow_offset=5)
+            cy += hl_lh
+        type_overlays.append(lay)
 
-    inc_frame = find_repo_incident_frame()
-    if inc_frame:
-        fr_img = Image.open(inc_frame).convert("RGBA").resize((w, h), Image.Resampling.LANCZOS)
-        ov = Image.alpha_composite(ov, fr_img)
+    # نوار زیرنویس متحرک شبکه خبر (مورد ۷)
+    ticker_msg = f"فوری: {clean_hl}" + (f"  —  {strip_emojis_for_font(subtext)}" if subtext else "")
+    ticker_strip = build_scrolling_ticker_strip(ticker_msg, duration, bg_color=(195, 22, 32, 248), height=78)
+    strip_w = ticker_strip.size[0]
+    ticker_y = 1665
 
-    ov_path = os.path.join(work_dir, "overlay.png")
-    ov.save(ov_path)
-
-    wav_path = generate_news_audio_wav(os.path.join(work_dir, "sfx.wav"), 14.0, mode="incident")
+    audio_path = get_audio_track(work_dir, duration, mode="incident")
     out_mp4 = os.path.join(TMP_ROOT, f"incident_reel_{int(time.time()*1000)}.mp4")
 
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", bg_path,
-        "-loop", "1", "-t", "14", "-i", glow_a,
-        "-loop", "1", "-t", "14", "-i", glow_b,
-        "-loop", "1", "-t", "14", "-i", ov_path,
-        "-i", wav_path,
-        "-filter_complex",
-        "[0:v]zoompan=z='1+0.00042*on':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=350:s=1080x1920:fps=25,format=rgba[bg];"
-        "[bg][1:v]overlay=0:0:enable='floor(2*t)-2*floor(t)'[s1];"
-        "[s1][2:v]overlay=0:0:enable='1-(floor(2*t)-2*floor(t))'[s2];"
-        "[s2][3:v]overlay=0:0,format=yuv420p[vout]",
-        "-map", "[vout]", "-map", "4:a",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
-        "-c:a", "aac", "-b:a", "128k",
-        "-movflags", "+faststart", "-t", "14", out_mp4,
-    ]
-    run_ffmpeg(cmd)
+    def frame_gen():
+        bh_src, bw_src = bg_arr.shape[:2]
+        for i in range(total_frames):
+            t = i / fps
+            # زوم پیش‌رونده + لرزش ضربه‌ای کوتاه در ۱.۵ ثانیه اول
+            zoom = 1.0 + 0.14 * (t / duration)
+            crop_w = int(bw_src / zoom)
+            crop_h = int(bh_src / zoom)
+            shake_x = int(math.sin(t * 58.0) * 18 * max(0.0, 1.0 - t / 1.5))
+            shake_y = int(math.cos(t * 64.0) * 18 * max(0.0, 1.0 - t / 1.5))
+
+            x0 = max(0, min(bw_src - crop_w, (bw_src - crop_w) // 2 + shake_x))
+            y0 = max(0, min(bh_src - crop_h, (bh_src - crop_h) // 2 + shake_y))
+            cropped = bg_arr[y0:y0 + crop_h, x0:x0 + crop_w]
+            resized = cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
+            frame = Image.fromarray(resized).convert("RGBA")
+
+            # نور چراغ گردان آژیر (تغییر سریع هر ۰.۳۸ ثانیه)
+            siren_img = siren_a if (int(t / 0.38) % 2 == 0) else siren_b
+            frame.alpha_composite(siren_img)
+            frame.alpha_composite(static_ov)
+
+            # نقطه قرمز چشمک‌زن LIVE در کادر فوری
+            if int(t * 3.5) % 2 == 0:
+                fd = ImageDraw.Draw(frame)
+                fd.ellipse([(w - 102, 142), (w - 70, 174)], fill=(250, 204, 21, 255))
+
+            # تایپ زنده تیتر کلمه‌به‌کلمه از ثانیه ۱.۲ تا ۵.۰
+            if t >= 1.1 and type_overlays:
+                prog = min(1.0, (t - 1.1) / max(1.8, min(3.8, len(type_overlays) * 0.35)))
+                idx = min(len(type_overlays) - 1, int(prog * len(type_overlays)))
+                frame.alpha_composite(type_overlays[idx])
+
+            # نوار زیرنویس متحرک شبکه خبر (ورود از چپ به راست)
+            src_x = max(0, min(strip_w - w, (strip_w - w) - int(t * 175)))
+            tick_crop = ticker_strip.crop((src_x, 0, src_x + w, 78))
+            frame.alpha_composite(tick_crop, (0, ticker_y))
+
+            # قلاب ۱.۵ ثانیه اول شوک (فلش سفید لحظه‌ای + کارت هشدار فوری)
+            if t < 0.16 or (0.48 <= t < 0.60):
+                frame.alpha_composite(shock_white)
+            elif t < 1.25:
+                frame.alpha_composite(shock_red)
+
+            yield np.array(frame.convert("RGB"), dtype=np.uint8)
+
+    pipe_frames_to_mp4(frame_gen(), out_mp4, audio_path, fps=fps)
     shutil.rmtree(work_dir, ignore_errors=True)
     return out_mp4
 
 
-# ==================== ۳. ریلز زوم سینمایی روی نقشه ====================
-def latlon_to_tile(lat: float, lon: float, zoom: int):
+# ==================== ۳. ریلز زوم سینمایی روی نقشه (رفع قطعی با ۳ سرور پشتیبان + زوم دومرحله‌ای) ====================
+def latlon_to_tile_float(lat: float, lon: float, zoom: int):
     lat_rad = math.radians(lat)
     n = 2.0 ** zoom
-    xtile = int((lon + 180.0) / 360.0 * n)
-    ytile = int((1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n)
-    return xtile, ytile
+    xf = (lon + 180.0) / 360.0 * n
+    yf = (1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n
+    return xf, yf
 
 
 async def resolve_location_coords(session: aiohttp.ClientSession, loc_name: str):
-    clean = loc_name.strip()
+    clean = strip_emojis_for_font(loc_name)
     for key, val in FARS_LOCATIONS.items():
         if key in clean:
             return val
     try:
         url = "https://nominatim.openstreetmap.org/search"
         params = {"q": f"{clean}, Iran", "format": "json", "limit": 1}
-        headers = {"User-Agent": "ShirazLastNewsStudioBot/1.0"}
+        headers = {"User-Agent": "ShirazLastNewsMedia/2.0 (contact@shirazlastnews.local)"}
         async with session.get(url, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 if data:
-                    return float(data[0]["lat"]), float(data[0]["lon"]), 13
+                    return float(data[0]["lat"]), float(data[0]["lon"]), 14
     except Exception:
         pass
     return FARS_LOCATIONS["شیراز"]
 
 
-async def fetch_dark_map_image(session: aiohttp.ClientSession, lat: float, lon: float, zoom: int) -> Image.Image:
-    cx, cy = latlon_to_tile(lat, lon, zoom)
-    grid = Image.new("RGB", (256 * 5, 256 * 5), (18, 24, 34))
-    headers = {"User-Agent": "ShirazLastNewsStudioBot/1.0"}
+async def fetch_reliable_map_image(session: aiohttp.ClientSession, lat: float, lon: float, zoom: int) -> Image.Image:
+    """دریافت نقشه واقعی از ۳ سرور پشتیبان (Esri Street، Carto Voyager، OpenStreetMap و Esri Satellite)."""
+    xf, yf = latlon_to_tile_float(lat, lon, zoom)
+    cx, cy = int(xf), int(yf)
+    max_t = (2 ** zoom) - 1
 
-    async def get_tile(dx, dy):
-        tx, ty = cx + dx, cy + dy
-        url = f"https://a.basemaps.cartocdn.com/dark_all/{zoom}/{tx}/{ty}.png"
-        try:
-            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=8)) as r:
-                if r.status == 200:
-                    raw = await r.read()
-                    tile = Image.open(io.BytesIO(raw)).convert("RGB")
-                    grid.paste(tile, ((dx + 2) * 256, (dy + 2) * 256))
-        except Exception:
-            pass
+    providers = [
+        ("esri_street", "https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}"),
+        ("carto_voyager", "https://a.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png"),
+        ("osm", "https://tile.openstreetmap.org/{z}/{x}/{y}.png"),
+        ("esri_sat", "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"),
+    ]
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+        "Accept": "image/avif,image/webp,image/png,image/*,*/*;q=0.8",
+    }
 
-    await asyncio.gather(*(get_tile(dx, dy) for dx in range(-2, 3) for dy in range(-2, 3)))
-    return fit_cover(grid, 1200, 2134)
+    for _, template in providers:
+        grid = Image.new("RGB", (256 * 5, 256 * 5), (20, 30, 46))
+        loaded = [0]
+
+        async def get_tile(dx, dy):
+            tx = max(0, min(max_t, cx + dx))
+            ty = max(0, min(max_t, cy + dy))
+            url = template.format(z=zoom, x=tx, y=ty)
+            try:
+                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=8)) as r:
+                    if r.status == 200:
+                        raw = await r.read()
+                        tile = Image.open(io.BytesIO(raw)).convert("RGB")
+                        grid.paste(tile, ((dx + 2) * 256, (dy + 2) * 256))
+                        loaded[0] += 1
+            except Exception:
+                pass
+
+        await asyncio.gather(*(get_tile(dx, dy) for dx in range(-2, 3) for dy in range(-2, 3)))
+        if loaded[0] >= 9:
+            # مرکز تصویر دقیقاً روی مختصات محله تنظیم می‌شود
+            px = int((xf - (cx - 2)) * 256)
+            py = int((yf - (cy - 2)) * 256)
+            half_w, half_h = 360, 640
+            left = max(0, min(grid.width - half_w * 2, px - half_w))
+            top = max(0, min(grid.height - half_h * 2, py - half_h))
+            cropped = grid.crop((left, top, left + half_w * 2, top + half_h * 2))
+            return cropped.resize((1200, 2134), Image.Resampling.LANCZOS)
+
+    # پشتیبان گرافیکی رادار فقط در صورت قطع سراسری تمام سرورهای نقشه
+    fallback = Image.new("RGB", (1200, 2134), (15, 26, 42))
+    fd = ImageDraw.Draw(fallback)
+    for x in range(0, 1200, 80):
+        fd.line([(x, 0), (x, 2134)], fill=(30, 48, 72), width=2)
+    for y in range(0, 2134, 80):
+        fd.line([(0, y), (1200, y)], fill=(30, 48, 72), width=2)
+    return fallback
 
 
-def build_map_zoom_reel_sync(map_img: Image.Image, photo_path: str, loc_name: str, headline: str) -> str:
-    w, h = 1080, 1920
+def build_map_zoom_reel_sync(wide_map: Image.Image, close_map: Image.Image, photo_path: str, loc_name: str, badge: str, headline: str, subtext: str) -> str:
+    """ریلز ۱۲ ثانیه‌ای زوم دومرحله‌ای روی نقشه واقعی + پین رادار متحرک + ورود به خبر با قاب ۳ باکسه پیج."""
+    w, h, fps, duration = 1080, 1920, 25, 12.0
+    total_frames = int(fps * duration)
     work_dir = tempfile.mkdtemp(dir=TMP_ROOT)
 
-    map_bg_path = os.path.join(work_dir, "map_bg.jpg")
-    map_img.save(map_bg_path, quality=92)
+    wide_arr = np.array(wide_map.convert("RGB"), dtype=np.uint8)
+    close_arr = np.array(close_map.convert("RGB"), dtype=np.uint8)
 
-    hud = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    hd = ImageDraw.Draw(hud)
-    cx, cy = w // 2, h // 2
+    if photo_path and os.path.exists(photo_path):
+        news_arr = np.array(fit_cover(Image.open(photo_path).convert("RGB"), 1200, 2134), dtype=np.uint8)
+    else:
+        news_arr = close_arr.copy()
 
-    hd.ellipse([(cx - 190, cy - 190), (cx + 190, cy + 190)], outline=(239, 68, 68, 95), width=4)
-    hd.ellipse([(cx - 120, cy - 120), (cx + 120, cy + 120)], outline=(239, 68, 68, 175), width=5)
-    hd.ellipse([(cx - 48, cy - 48), (cx + 48, cy + 48)], fill=(239, 68, 68, 90), outline=(255, 255, 255, 230), width=4)
-    hd.ellipse([(cx - 16, cy - 16), (cx + 16, cy + 16)], fill=(239, 68, 68, 255))
+    # لایه هدر و برچسب موقعیت روی نقشه
+    map_hud = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    hd = ImageDraw.Draw(map_hud)
+    for y in range(240):
+        hd.line([(0, y), (w, y)], fill=(10, 18, 32, int(225 * (1 - y / 240))))
+    for y in range(1580, h):
+        r = (y - 1580) / (h - 1580)
+        hd.line([(0, y), (w, y)], fill=(10, 18, 32, int(235 * r)))
+    draw_rtl_text(hd, (w // 2, 56), f"گزارش مکانی  |  {BRAND_TITLE_FA}", load_font("bold", 40), (250, 204, 21, 255), align="center")
 
+    loc_clean = strip_emojis_for_font(loc_name)
+    loc_txt = f"موقعیت: {loc_clean}"
     f_loc = load_font("display", 54)
-    loc_txt = f"موقعیت: {loc_name}"
     l_draw, l_kw = prepare_text_and_kwargs(loc_txt, is_rtl=True)
     lb = hd.textbbox((0, 0), l_draw, font=f_loc, **l_kw)
-    lw = min(w - 100, (lb[2] - lb[0]) + 84)
-    hd.rounded_rectangle([(cx - lw // 2, cy + 90), (cx + lw // 2, cy + 178)], radius=14, fill=(220, 38, 38, 240), outline=(255, 255, 255, 220), width=3)
-    draw_rtl_text(hd, (cx, cy + 104), loc_txt, f_loc, (255, 255, 255, 255), align="center", shadow=False)
+    lw = min(w - 100, (lb[2] - lb[0]) + 90)
+    cx, cy = w // 2, h // 2
+    hd.rounded_rectangle([(cx - lw // 2, cy + 95), (cx + lw // 2, cy + 185)], radius=16, fill=(220, 38, 38, 245), outline=(255, 255, 255, 240), width=4)
+    draw_rtl_text(hd, (cx, cy + 110), loc_txt, f_loc, (255, 255, 255, 255), align="center", shadow=False)
 
-    hd.rectangle([(0, 0), (w, 130)], fill=(10, 15, 25, 210))
-    draw_rtl_text(hd, (w // 2, 36), f"گزارش مکانی | {BRAND_TITLE_FA}", load_font("bold", 38), (234, 179, 8, 255), align="center")
-    hud_path = os.path.join(work_dir, "hud.png")
-    hud.save(hud_path)
+    # لایه خبر (از قاب ۳ باکسه reel_frame.png با متن‌های پرشده استفاده می‌کند)
+    repo_frame = find_repo_reel_frame() if CONFIG["use_repo_frame"] else ""
+    if repo_frame:
+        filled_path = render_reel_frame_overlay(repo_frame, badge or loc_clean, headline, subtext, work_dir)
+        news_ov = Image.open(filled_path).convert("RGBA")
+    else:
+        card_p = render_news_card_sync(photo_path, badge or loc_clean, headline, subtext, fmt="story", theme_key=CONFIG["theme"])
+        news_ov = Image.open(card_p).convert("RGBA")
 
-    card_path = render_news_card_sync(photo_path, f"گزارش از {loc_name}", headline, "", fmt="story", theme_key=CONFIG["theme"])
-    news_bg_path = os.path.join(work_dir, "news_bg.jpg")
-    Image.open(card_path).convert("RGB").resize((1200, 2134), Image.Resampling.LANCZOS).save(news_bg_path, quality=92)
-
-    clip1 = os.path.join(work_dir, "c1.mp4")
-    clip2 = os.path.join(work_dir, "c2.mp4")
-    wav_path = generate_news_audio_wav(os.path.join(work_dir, "map_sfx.wav"), 12.0, mode="news")
+    ticker_strip = build_scrolling_ticker_strip(f"{loc_clean}: {headline}", duration, bg_color=(15, 23, 42, 235), height=70)
+    strip_w = ticker_strip.size[0]
+    audio_path = get_audio_track(work_dir, duration, mode="news")
     out_mp4 = os.path.join(TMP_ROOT, f"map_reel_{int(time.time()*1000)}.mp4")
 
-    run_ffmpeg([
-        "ffmpeg", "-y", "-i", map_bg_path, "-loop", "1", "-t", "4.5", "-i", hud_path,
-        "-filter_complex",
-        "[0:v]zoompan=z='1+0.0042*on':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=113:s=1080x1920:fps=25,format=rgba[m];"
-        "[m][1:v]overlay=0:0,format=yuv420p,setsar=1[v]",
-        "-map", "[v]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-t", "4.5", clip1
-    ])
+    def zoom_slice(arr, zoom_val):
+        ah, aw = arr.shape[:2]
+        cw, ch = int(aw / zoom_val), int(ah / zoom_val)
+        x0, y0 = (aw - cw) // 2, (ah - ch) // 2
+        return cv2.resize(arr[y0:y0 + ch, x0:x0 + cw], (w, h), interpolation=cv2.INTER_LINEAR)
 
-    run_ffmpeg([
-        "ffmpeg", "-y", "-i", news_bg_path,
-        "-vf", "zoompan=z='1+0.0005*on':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=200:s=1080x1920:fps=25,format=yuv420p,setsar=1",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-t", "8", clip2
-    ])
+    def frame_gen():
+        for i in range(total_frames):
+            t = i / fps
+            if t < 2.6:
+                # مرحله ۱: زوم سریع از نقشه کلان استان به سمت شهر
+                z = 1.0 + 0.55 * (t / 2.6)
+                base_rgb = zoom_slice(wide_arr, z)
+                frame = Image.fromarray(base_rgb).convert("RGBA")
+                frame.alpha_composite(map_hud)
+            elif t < 5.6:
+                # مرحله ۲: نمای دقیق خیابان‌ها و محله + موج رادار متحرک
+                lt = (t - 2.6) / 3.0
+                z = 1.0 + 0.25 * lt
+                close_rgb = zoom_slice(close_arr, z)
+                if t < 3.1:
+                    alpha = (t - 2.6) / 0.5
+                    wide_rgb = zoom_slice(wide_arr, 1.55)
+                    close_rgb = cv2.addWeighted(wide_rgb, 1.0 - alpha, close_rgb, alpha, 0)
+                frame = Image.fromarray(close_rgb).convert("RGBA")
+                frame.alpha_composite(map_hud)
 
-    repo_frame = find_repo_reel_frame() if CONFIG["use_repo_frame"] else ""
-    cmd = ["ffmpeg", "-y", "-i", clip1, "-i", clip2, "-i", wav_path]
-    base_xf = "[0:v]fps=25,format=yuv420p,settb=AVTB[v0];[1:v]fps=25,format=yuv420p,settb=AVTB[v1];[v0][v1]xfade=transition=fade:duration=0.5:offset=4.0"
-    if repo_frame:
-        fr_p = prepare_rgba_frame_1080x1920(repo_frame, work_dir)
-        cmd += ["-loop", "1", "-t", "12", "-i", fr_p]
-        fcomp = f"{base_xf},format=rgba[xf];[xf][3:v]overlay=0:0,format=yuv420p[v]"
-    else:
-        fcomp = f"{base_xf},format=yuv420p[v]"
+                # پین رادار نبض‌دار قرمز در مرکز دقیق محله
+                rd = ImageDraw.Draw(frame)
+                pulse_r = int(35 + ((t * 160) % 180))
+                pulse_a = max(30, int(230 * (1.0 - (pulse_r - 35) / 180.0)))
+                rd.ellipse([(cx - pulse_r, cy - pulse_r), (cx + pulse_r, cy + pulse_r)], outline=(239, 68, 68, pulse_a), width=6)
+                rd.ellipse([(cx - 42, cy - 42), (cx + 42, cy + 42)], fill=(239, 68, 68, 120), outline=(255, 255, 255, 240), width=4)
+                rd.ellipse([(cx - 16, cy - 16), (cx + 16, cy + 16)], fill=(220, 38, 38, 255))
+            else:
+                # مرحله ۳: ورود به تصویر خبر با قاب ۳ باکسه پرشده
+                nt = (t - 5.6) / 6.4
+                z = 1.0 + 0.10 * nt
+                n_rgb = zoom_slice(news_arr, z)
+                if t < 6.1:
+                    alpha = (t - 5.6) / 0.5
+                    m_rgb = zoom_slice(close_arr, 1.25)
+                    n_rgb = cv2.addWeighted(m_rgb, 1.0 - alpha, n_rgb, alpha, 0)
+                frame = Image.fromarray(n_rgb).convert("RGBA")
+                frame.alpha_composite(news_ov)
 
-    cmd += [
-        "-filter_complex", fcomp, "-map", "[v]", "-map", "2:a",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
-        "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", "-t", "12", out_mp4
-    ]
-    run_ffmpeg(cmd)
+            if CONFIG.get("video_ticker", True):
+                src_x = max(0, min(strip_w - w, (strip_w - w) - int(t * 165)))
+                tick_crop = ticker_strip.crop((src_x, 0, src_x + w, 70))
+                frame.alpha_composite(tick_crop, (0, 1795))
+
+            yield np.array(frame.convert("RGB"), dtype=np.uint8)
+
+    pipe_frames_to_mp4(frame_gen(), out_mp4, audio_path, fps=fps)
     shutil.rmtree(work_dir, ignore_errors=True)
     return out_mp4
 
 
 # ==================== ۴. ریلز جمع‌بندی «۶۰ ثانیه با اخبار شیراز» ====================
 def build_daily_summary_reel_sync(items: list) -> str:
-    w, h = 1080, 1920
+    w, h, fps = 1080, 1920, 25
     work_dir = tempfile.mkdtemp(dir=TMP_ROOT)
     theme = THEMES.get(CONFIG["theme"], THEMES["navy"])
-    clips = []
+    repo_frame = find_repo_reel_frame() if CONFIG["use_repo_frame"] else ""
 
     jnow = jdatetime.datetime.fromgregorian(datetime=get_tehran_now())
     date_str = to_persian_digits(f"{JALALI_WEEKDAYS[jnow.weekday()]} {jnow.day} {JALALI_MONTHS[jnow.month]} {jnow.year}")
 
+    # اسلاید مقدمه
     intro = Image.new("RGB", (w, h), theme["bg"])
     idraw = ImageDraw.Draw(intro)
     idraw.rectangle([(0, 0), (w, 24)], fill=theme["accent"])
@@ -1223,75 +1801,67 @@ def build_daily_summary_reel_sync(items: list) -> str:
     draw_rtl_text(idraw, (w // 2, 620), "بسته خبری روزانه", load_font("bold", 48), theme["accent"], align="center")
     draw_rtl_text(idraw, (w // 2, 720), "۶۰ ثانیه با اخبار شیراز", load_font("display", 94), theme["text"], align="center")
     draw_rtl_text(idraw, (w // 2, 880), date_str, load_font("bold", 42), theme["subtext"], align="center")
-    draw_rtl_text(idraw, (w // 2, 1080), f"{to_persian_digits(str(len(items)))} تیتر برگزیده امروز", load_font("bold", 40), theme["accent"], align="center")
+    draw_rtl_text(idraw, (w // 2, 1080), f"{to_persian_digits(str(len(items[:6])))} تیتر برگزیده امروز", load_font("bold", 40), theme["accent"], align="center")
     draw_rtl_text(idraw, (w // 2, 1680), BRAND_HANDLE, load_font("bold", 42), theme["text"], align="center", is_rtl=False)
-    intro_img = os.path.join(work_dir, "intro.jpg")
-    intro.save(intro_img, quality=92)
-    intro_mp4 = os.path.join(work_dir, "s_00.mp4")
-    run_ffmpeg([
-        "ffmpeg", "-y", "-i", intro_img,
-        "-vf", "zoompan=z='1+0.0009*on':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=63:s=1080x1920:fps=25,format=yuv420p,setsar=1",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-t", "2.5", intro_mp4
-    ])
-    clips.append(intro_mp4)
 
+    # اسلایدهای خبر (با پر کردن هر ۳ باکس قاب ریلز در صورت وجود)
+    slide_imgs = [(intro, 2.5)]
     for idx, item in enumerate(items[:6], start=1):
-        badge = f"خبر {to_persian_digits(str(idx))} از {to_persian_digits(str(len(items[:6])))}  |  {item.get('tag', 'شیراز')}"
-        card_p = render_news_card_sync(item.get("photo"), badge, item["headline"], f"ثبت‌شده در ساعت {to_persian_digits(item.get('time', ''))}", fmt="story", theme_key=CONFIG["theme"])
-        c_mp4 = os.path.join(work_dir, f"s_{idx:02d}.mp4")
-        run_ffmpeg([
-            "ffmpeg", "-y", "-i", card_p,
-            "-vf", "zoompan=z='1+0.00055*on':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=138:s=1080x1920:fps=25,format=yuv420p,setsar=1",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-t", "5.5", c_mp4
-        ])
-        clips.append(c_mp4)
+        badge = f"خبر {to_persian_digits(str(idx))} از {to_persian_digits(str(len(items[:6])))}"
+        sub = f"بخش {item.get('tag', 'شیراز')}  |  ثبت در ساعت {to_persian_digits(item.get('time', ''))}"
+        if repo_frame:
+            bg = fit_cover(Image.open(item["photo"]).convert("RGB"), w, h).convert("RGBA") if (item.get("photo") and os.path.exists(item["photo"])) else Image.new("RGBA", (w, h), theme["bg"] + (255,))
+            ov_p = render_reel_frame_overlay(repo_frame, badge, item["headline"], sub, work_dir)
+            bg.alpha_composite(Image.open(ov_p).convert("RGBA"))
+            slide_imgs.append((bg.convert("RGB"), 5.0))
+        else:
+            cp = render_news_card_sync(item.get("photo"), badge, item["headline"], sub, fmt="story", theme_key=CONFIG["theme"])
+            slide_imgs.append((Image.open(cp).convert("RGB"), 5.0))
 
-    clips.append(build_endscreen_clip_sync(work_dir, duration=2.5))
+    # اسلاید پایانی دعوت به فالو
+    outro = Image.new("RGB", (w, h), theme["bg"])
+    od = ImageDraw.Draw(outro)
+    od.rectangle([(0, 0), (w, 22)], fill=theme["accent"])
+    od.rectangle([(0, h - 22), (w, h)], fill=theme["accent"])
+    draw_rtl_text(od, (w // 2, 740), BRAND_TITLE_FA, load_font("display", 84), theme["text"], align="center")
+    draw_rtl_text(od, (w // 2, 880), "برای پیگیری لحظه‌ای اخبار شیراز و فارس فالو کنید", load_font("bold", 38), theme["subtext"], align="center")
+    od.rounded_rectangle([(260, 990), (820, 1100)], radius=20, fill=theme["accent"])
+    draw_rtl_text(od, (w // 2, 1018), BRAND_HANDLE, load_font("bold", 48), (15, 23, 42), align="center", shadow=False, is_rtl=False)
+    slide_imgs.append((outro, 2.5))
 
-    list_file = os.path.join(work_dir, "concat.txt")
-    with open(list_file, "w") as f:
-        for c in clips:
-            f.write(f"file '{c}'\n")
-
-    total_sec = 2.5 + len(items[:6]) * 5.5 + 2.5
-    wav_path = generate_news_audio_wav(os.path.join(work_dir, "daily_sfx.wav"), total_sec, mode="news")
+    total_sec = sum(d for _, d in slide_imgs)
+    audio_path = get_audio_track(work_dir, total_sec, mode="news")
     out_mp4 = os.path.join(TMP_ROOT, f"daily60_{int(time.time()*1000)}.mp4")
-    repo_frame = find_repo_reel_frame() if CONFIG["use_repo_frame"] else ""
 
-    cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_file, "-i", wav_path]
-    if repo_frame:
-        fr_p = prepare_rgba_frame_1080x1920(repo_frame, work_dir)
-        cmd += ["-loop", "1", "-t", str(total_sec), "-i", fr_p,
-                "-filter_complex", "[0:v]format=rgba[base];[base][2:v]overlay=0:0:shortest=1,format=yuv420p[v]",
-                "-map", "[v]", "-map", "1:a"]
-    else:
-        cmd += ["-map", "0:v", "-map", "1:a"]
+    def frame_gen():
+        for img_pil, dur in slide_imgs:
+            arr = np.array(img_pil.resize((1160, 2062), Image.Resampling.LANCZOS), dtype=np.uint8)
+            ah, aw = arr.shape[:2]
+            n_f = int(dur * fps)
+            for i in range(n_f):
+                z = 1.0 + 0.06 * (i / max(1, n_f))
+                cw, ch = int(aw / z), int(ah / z)
+                x0, y0 = (aw - cw) // 2, (ah - ch) // 2
+                yield cv2.resize(arr[y0:y0 + ch, x0:x0 + cw], (w, h), interpolation=cv2.INTER_LINEAR)
 
-    cmd += [
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
-        "-c:a", "aac", "-b:a", "128k", "-shortest", "-movflags", "+faststart", out_mp4
-    ]
-    run_ffmpeg(cmd)
+    pipe_frames_to_mp4(frame_gen(), out_mp4, audio_path, fps=fps)
     shutil.rmtree(work_dir, ignore_errors=True)
     return out_mp4
 
 
 # ==================== ۵. ریلز موج صوتی (Audiogram) ====================
-def build_audiogram_reel_sync(audio_path: str, headline: str, speaker_photo: str = None) -> str:
+def build_audiogram_reel_sync(audio_path: str, badge: str, headline: str, subtext: str, speaker_photo: str = None) -> str:
     w, h = 1080, 1920
     work_dir = tempfile.mkdtemp(dir=TMP_ROOT)
     theme = THEMES.get(CONFIG["theme"], THEMES["navy"])
 
     bg = Image.new("RGBA", (w, h), theme["bg"] + (255,))
     draw = ImageDraw.Draw(bg)
-
     draw.rectangle([(0, 0), (w, 18)], fill=theme["accent"] + (255,))
     draw.rectangle([(0, h - 18), (w, h)], fill=theme["accent"] + (255,))
-    draw_rtl_text(draw, (w // 2, 145), "گزارش صوتی اختصاصی", load_font("bold", 40), theme["accent"] + (255,), align="center")
-    draw_rtl_text(draw, (w // 2, 210), BRAND_TITLE_FA, load_font("display", 54), theme["text"] + (255,), align="center")
 
-    circle_r = 205
-    cx, cy = w // 2, 560
+    circle_r = 215
+    cx, cy = w // 2, 540
     draw.ellipse([(cx - circle_r - 12, cy - circle_r - 12), (cx + circle_r + 12, cy + circle_r + 12)], fill=theme["accent"] + (255,))
 
     if speaker_photo and os.path.exists(speaker_photo):
@@ -1303,49 +1873,37 @@ def build_audiogram_reel_sync(audio_path: str, headline: str, speaker_photo: str
         draw.ellipse([(cx - circle_r, cy - circle_r), (cx + circle_r, cy + circle_r)], fill=(25, 42, 72, 255))
         draw_rtl_text(draw, (cx, cy - 34), "گزارش صوتی", load_font("display", 56), theme["text"] + (255,), align="center")
 
-    f_title = load_font("display", 70)
-    lines = wrap_persian_lines(draw, headline, f_title, w - 140, max_lines=3)
-    ty = 840
-    for ln in lines:
-        draw_rtl_text(draw, (w // 2, ty), ln, f_title, theme["text"] + (255,), align="center")
-        ty += 94
-
-    draw.rounded_rectangle([(60, 1210), (w - 60, 1490)], radius=24, fill=(0, 0, 0, 100), outline=theme["accent"] + (160,), width=3)
-    draw_rtl_text(draw, (w // 2, 1630), BRAND_HANDLE, load_font("bold", 38), theme["accent"] + (255,), align="center", is_rtl=False)
+    repo_frame = find_repo_reel_frame() if CONFIG["use_repo_frame"] else ""
+    wave_y = 795 if repo_frame else 1235
+    if repo_frame:
+        ov_p = render_reel_frame_overlay(repo_frame, badge or "گزارش صوتی", headline, subtext, work_dir)
+        bg.alpha_composite(Image.open(ov_p).convert("RGBA"))
+    else:
+        draw_rtl_text(draw, (w // 2, 145), "گزارش صوتی اختصاصی", load_font("bold", 40), theme["accent"] + (255,), align="center")
+        draw_rtl_text(draw, (w // 2, 210), BRAND_TITLE_FA, load_font("display", 54), theme["text"] + (255,), align="center")
+        draw_centered_block_in_box(draw, (70, 820, w - 70, 1170), headline, "display", theme["text"] + (255,), max_size=68, min_size=30, max_lines=3)
+        draw.rounded_rectangle([(60, 1210), (w - 60, 1490)], radius=24, fill=(0, 0, 0, 100), outline=theme["accent"] + (160,), width=3)
+        draw_rtl_text(draw, (w // 2, 1630), BRAND_HANDLE, load_font("bold", 38), theme["accent"] + (255,), align="center", is_rtl=False)
 
     bg_path = os.path.join(work_dir, "audio_bg.png")
     bg.convert("RGB").save(bg_path)
 
     out_mp4 = os.path.join(TMP_ROOT, f"audiogram_{int(time.time()*1000)}.mp4")
     wave_color = theme["wave_hex"]
-    repo_frame = find_repo_reel_frame() if CONFIG["use_repo_frame"] else ""
-
-    cmd = ["ffmpeg", "-y", "-loop", "1", "-i", bg_path, "-i", audio_path]
-    if repo_frame:
-        fr_p = prepare_rgba_frame_1080x1920(repo_frame, work_dir)
-        cmd += ["-loop", "1", "-i", fr_p]
-        fcomp = (
-            f"[1:a]showwaves=s=920x230:mode=cline:rate=25:colors={wave_color}[w];"
-            "[0:v][w]overlay=(W-w)/2:1235:shortest=1,format=rgba[bw];"
-            "[bw][2:v]overlay=0:0:shortest=1,format=yuv420p[v]"
-        )
-    else:
-        fcomp = (
-            f"[1:a]showwaves=s=920x230:mode=cline:rate=25:colors={wave_color}[w];"
-            "[0:v][w]overlay=(W-w)/2:1235:shortest=1,format=yuv420p[v]"
-        )
-
-    cmd += [
-        "-filter_complex", fcomp, "-map", "[v]", "-map", "1:a",
+    run_ffmpeg([
+        "ffmpeg", "-y", "-loop", "1", "-i", bg_path, "-i", audio_path,
+        "-filter_complex",
+        f"[1:a]showwaves=s=920x190:mode=cline:rate=25:colors={wave_color}[w];"
+        f"[0:v][w]overlay=(W-w)/2:{wave_y}:shortest=1,format=yuv420p[v]",
+        "-map", "[v]", "-map", "1:a",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
         "-c:a", "aac", "-b:a", "128k", "-shortest", "-movflags", "+faststart", out_mp4
-    ]
-    run_ffmpeg(cmd)
+    ])
     shutil.rmtree(work_dir, ignore_errors=True)
     return out_mp4
 
 
-# ==================== ۶. استودیو تدوین ویدئو (اصالت + چهره + قاب ریلز + اند-اسکرین) ====================
+# ==================== ۶. استودیو تدوین ویدئو (با پر کردن خودکار ۳ باکس قاب ریلز + قلاب شوک + زیرنویس متحرک) ====================
 def probe_video_info(video_path: str) -> dict:
     cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", "-show_format", video_path]
     res = subprocess.run(cmd, capture_output=True, text=True)
@@ -1390,19 +1948,6 @@ def detect_face_center_x(video_path: str) -> int:
     return -1
 
 
-def build_lower_third_png(work_dir: str) -> str:
-    theme = THEMES.get(CONFIG["theme"], THEMES["navy"])
-    ov = Image.new("RGBA", (1080, 1920), (0, 0, 0, 0))
-    d = ImageDraw.Draw(ov)
-    d.rounded_rectangle([(560, 1560), (1035, 1665)], radius=16, fill=theme["bg"] + (225,), outline=theme["accent"] + (255,), width=3)
-    d.rectangle([(1018, 1574), (1028, 1651)], fill=theme["accent"] + (255,))
-    draw_rtl_text(d, (1000, 1574), BRAND_TITLE_FA, load_font("bold", 30), theme["text"] + (255,), align="right", shadow=False)
-    draw_rtl_text(d, (585, 1618), BRAND_HANDLE, load_font("bold", 26), theme["accent"] + (255,), align="left", shadow=False, is_rtl=False)
-    p = os.path.join(work_dir, "lower_third.png")
-    ov.save(p)
-    return p
-
-
 def build_endscreen_clip_sync(work_dir: str, duration: float = 2.2, with_silent_audio: bool = False) -> str:
     theme = THEMES.get(CONFIG["theme"], THEMES["navy"])
     im = Image.new("RGB", (1080, 1920), theme["bg"])
@@ -1421,10 +1966,7 @@ def build_endscreen_clip_sync(work_dir: str, duration: float = 2.2, with_silent_
     cmd = ["ffmpeg", "-y", "-loop", "1", "-t", str(duration), "-i", img_p]
     if with_silent_audio:
         cmd += ["-f", "lavfi", "-t", str(duration), "-i", "anullsrc=channel_layout=stereo:sample_rate=44100"]
-    cmd += [
-        "-vf", "scale=1080:1920,fps=25,format=yuv420p,setsar=1",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
-    ]
+    cmd += ["-vf", "scale=1080:1920,fps=25,format=yuv420p,setsar=1", "-c:v", "libx264", "-preset", "veryfast", "-crf", "22"]
     if with_silent_audio:
         cmd += ["-c:a", "aac", "-ar", "44100", "-ac", "2", "-b:a", "128k"]
     cmd += ["-t", str(duration), mp4_p]
@@ -1432,16 +1974,47 @@ def build_endscreen_clip_sync(work_dir: str, duration: float = 2.2, with_silent_
     return mp4_p
 
 
-def process_video_studio_sync(video_path: str) -> tuple:
+def build_hook_intro_clip_sync(work_dir: str, badge: str, headline: str, with_audio: bool = True) -> str:
+    """قلاب ۱.۳ ثانیه‌ای شوک در ابتدای ریلز (مورد ۵)."""
+    theme = THEMES.get(CONFIG["theme"], THEMES["navy"])
+    im = Image.new("RGB", (1080, 1920), (14, 10, 16))
+    d = ImageDraw.Draw(im)
+    d.rectangle([(0, 0), (1080, 28)], fill=(220, 38, 38))
+    d.rectangle([(0, 1892), (1080, 1920)], fill=(250, 204, 21))
+    d.rounded_rectangle([(310, 620), (770, 715)], radius=16, fill=(220, 38, 38))
+    draw_rtl_text(d, (540, 636), badge or "خبر فوری", load_font("display", 54), (255, 255, 255), align="center", shadow=False)
+    draw_centered_block_in_box(d, (70, 760, 1010, 1180), headline, "display", (255, 255, 255), max_size=76, min_size=36, max_lines=3, shadow=True)
+    draw_rtl_text(d, (540, 1340), BRAND_HANDLE, load_font("bold", 42), theme["accent"], align="center", is_rtl=False)
+
+    img_p = os.path.join(work_dir, "hook.jpg")
+    im.save(img_p, quality=92)
+    mp4_p = os.path.join(work_dir, "hook.mp4")
+
+    cmd = ["ffmpeg", "-y", "-loop", "1", "-t", "1.3", "-i", img_p]
+    if with_audio:
+        wav_p = generate_emergency_audio_wav(os.path.join(work_dir, "hook.wav"), 1.3, mode="incident")
+        cmd += ["-i", wav_p]
+    cmd += ["-vf", "scale=1080:1920,fps=25,format=yuv420p,setsar=1", "-c:v", "libx264", "-preset", "veryfast", "-crf", "22"]
+    if with_audio:
+        cmd += ["-c:a", "aac", "-ar", "44100", "-ac", "2", "-b:a", "128k"]
+    cmd += ["-t", "1.3", mp4_p]
+    run_ffmpeg(cmd)
+    return mp4_p
+
+
+def process_video_studio_sync(video_path: str, badge: str, headline: str, subtext: str) -> tuple:
     work_dir = tempfile.mkdtemp(dir=TMP_ROOT)
     info = probe_video_info(video_path)
     w, h = info["width"], info["height"]
     has_audio = info["has_audio"]
+    dur = info["duration"]
 
     applied = []
     use_antidup = CONFIG["video_antidup"]
     use_facetrack = CONFIG["video_facetrack"]
     use_brand = CONFIG["video_brand"]
+    use_ticker = CONFIG.get("video_ticker", True)
+    use_hook = CONFIG.get("video_hook_intro", True)
     repo_frame = find_repo_reel_frame() if CONFIG["use_repo_frame"] else ""
 
     if use_facetrack and w > h:
@@ -1471,21 +2044,32 @@ def process_video_studio_sync(video_path: str) -> tuple:
         v_chain += ",scale=1112:1978,crop=1080:1920,eq=contrast=1.02:saturation=1.03:brightness=0.008,setpts=PTS/1.015"
         applied.append("اصالت‌سازی و حذف متادیتا ✅")
 
-    v_chain += ",fps=25,setsar=1"
-
+    v_chain += ",fps=25,setsar=1,format=rgba[cur0]"
+    cur_label = "cur0"
     inputs = ["-i", video_path]
+    inp_idx = 1
+
+    # پر کردن خودکار هر ۳ باکس قاب reel_frame.png و قرار دادن روی ویدئو
     if repo_frame:
-        fr_p = prepare_rgba_frame_1080x1920(repo_frame, work_dir)
-        inputs += ["-loop", "1", "-i", fr_p]
-        v_chain += ",format=rgba[mainv];[mainv][1:v]overlay=0:0:shortest=1,format=yuv420p[vout]"
-        applied.append(f"قاب ریلز اختصاصی مخزن ({os.path.basename(repo_frame)}) ✅")
-    elif use_brand:
-        lt_png = build_lower_third_png(work_dir)
-        inputs += ["-loop", "1", "-i", lt_png]
-        v_chain += ",format=rgba[mainv];[mainv][1:v]overlay=0:0:shortest=1:enable='floor(t)',format=yuv420p[vout]"
-        applied.append("نوار برند Lower-Third ✅")
-    else:
-        v_chain += ",format=yuv420p[vout]"
+        filled_fr = render_reel_frame_overlay(repo_frame, badge, headline, subtext, work_dir)
+        inputs += ["-loop", "1", "-i", filled_fr]
+        v_chain += f";[{cur_label}][{inp_idx}:v]overlay=0:0:shortest=1[cur{inp_idx}]"
+        cur_label = f"cur{inp_idx}"
+        inp_idx += 1
+        applied.append("قاب ۳ باکسه ریلز با متن خودکار ✅")
+
+    # نوار زیرنویس متحرک شبکه خبر در پایین ویدئو (مورد ۷ - بدون کاما در فرمول)
+    if use_ticker and headline:
+        t_strip = build_scrolling_ticker_strip(f"{headline} — {subtext}", dur + 2.0, bg_color=(185, 28, 28, 240), height=68)
+        t_path = os.path.join(work_dir, "ticker.png")
+        t_strip.save(t_path, format="PNG")
+        inputs += ["-loop", "1", "-i", t_path]
+        v_chain += f";[{cur_label}][{inp_idx}:v]overlay=x='-w+1080+165*t':y=1795:shortest=1[cur{inp_idx}]"
+        cur_label = f"cur{inp_idx}"
+        inp_idx += 1
+        applied.append("نوار زیرنویس متحرک شبکه خبر ✅")
+
+    v_chain += f";[{cur_label}]format=yuv420p[vout]"
 
     main_processed = os.path.join(work_dir, "main_proc.mp4")
     cmd = ["ffmpeg", "-y"] + inputs + ["-filter_complex", v_chain, "-map", "[vout]"]
@@ -1493,36 +2077,33 @@ def process_video_studio_sync(video_path: str) -> tuple:
         if use_antidup:
             cmd += ["-filter:a", "atempo=1.015"]
         cmd += ["-map", "0:a", "-c:a", "aac", "-ar", "44100", "-ac", "2", "-b:a", "128k"]
-    cmd += [
-        "-map_metadata", "-1",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
-        "-movflags", "+faststart", main_processed
-    ]
+    cmd += ["-map_metadata", "-1", "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-movflags", "+faststart", main_processed]
     run_ffmpeg(cmd)
 
-    out_mp4 = os.path.join(TMP_ROOT, f"studio_vid_{int(time.time()*1000)}.mp4")
+    # اتصال قلاب ۱.۳ ثانیه‌ای شوک در ابتدا و اند-اسکرین ۲.۲ ثانیه‌ای در انتها
+    segments = []
+    if use_hook:
+        segments.append(build_hook_intro_clip_sync(work_dir, badge, headline, with_audio=has_audio))
+        applied.append("قلاب شوک اول ویدئو (۱.۳ ثانیه) ✅")
+    segments.append(main_processed)
     if use_brand:
-        end_clip = build_endscreen_clip_sync(work_dir, duration=2.2, with_silent_audio=has_audio)
-        applied.append("اند-اسکرین دعوت به فالو (۲.۲ ثانیه) ✅")
+        segments.append(build_endscreen_clip_sync(work_dir, duration=2.2, with_silent_audio=has_audio))
+        applied.append("اند-اسکرین دعوت به فالو ✅")
+
+    out_mp4 = os.path.join(TMP_ROOT, f"studio_vid_{int(time.time()*1000)}.mp4")
+    if len(segments) > 1:
+        c_cmd = ["ffmpeg", "-y"]
+        for s in segments:
+            c_cmd += ["-i", s]
+        n = len(segments)
         if has_audio:
-            run_ffmpeg([
-                "ffmpeg", "-y", "-i", main_processed, "-i", end_clip,
-                "-filter_complex", "[0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1[v][a]",
-                "-map", "[v]", "-map", "[a]",
-                "-map_metadata", "-1",
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
-                "-c:a", "aac", "-ar", "44100", "-ac", "2", "-b:a", "128k",
-                "-movflags", "+faststart", out_mp4
-            ])
+            streams = "".join(f"[{k}:v][{k}:a]" for k in range(n))
+            c_cmd += ["-filter_complex", f"{streams}concat=n={n}:v=1:a=1[v][a]", "-map", "[v]", "-map", "[a]", "-c:a", "aac", "-ar", "44100", "-ac", "2", "-b:a", "128k"]
         else:
-            run_ffmpeg([
-                "ffmpeg", "-y", "-i", main_processed, "-i", end_clip,
-                "-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0[v]",
-                "-map", "[v]",
-                "-map_metadata", "-1",
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
-                "-movflags", "+faststart", out_mp4
-            ])
+            streams = "".join(f"[{k}:v]" for k in range(n))
+            c_cmd += ["-filter_complex", f"{streams}concat=n={n}:v=1:a=0[v]", "-map", "[v]"]
+        c_cmd += ["-map_metadata", "-1", "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-movflags", "+faststart", out_mp4]
+        run_ffmpeg(c_cmd)
     else:
         shutil.copy(main_processed, out_mp4)
 
@@ -1530,7 +2111,51 @@ def process_video_studio_sync(video_path: str) -> tuple:
     return out_mp4, applied
 
 
-# ==================== ۷. کارت مناسبت‌نگار روزانه ====================
+# ==================== ۷. حذف واترمارک و لوگوی خبرگزاری‌ها از ۴ گوشه (مورد ۹) ====================
+def calc_corner_rect(w: int, h: int, corner: str) -> tuple:
+    rw = max(60, int(w * 0.24))
+    rh = max(45, int(h * 0.12))
+    margin = max(8, int(min(w, h) * 0.015))
+    if corner == "tr":
+        return w - rw - margin, margin, rw, rh
+    if corner == "tl":
+        return margin, margin, rw, rh
+    if corner == "br":
+        return w - rw - margin, h - rh - margin, rw, rh
+    return margin, h - rh - margin, rw, rh
+
+
+def clean_corner_logo_photo_sync(photo_path: str, corner: str) -> str:
+    img = cv2.imread(photo_path)
+    h, w = img.shape[:2]
+    x, y, rw, rh = calc_corner_rect(w, h, corner)
+    mask = np.zeros((h, w), dtype=np.uint8)
+    mask[y:y + rh, x:x + rw] = 255
+    cleaned = cv2.inpaint(img, mask, 9, cv2.INPAINT_TELEA)
+    out_p = os.path.join(TMP_ROOT, f"clean_logo_{int(time.time()*1000)}.jpg")
+    cv2.imwrite(out_p, cleaned, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+    return out_p
+
+
+def clean_corner_logo_video_sync(video_path: str, corner: str) -> str:
+    info = probe_video_info(video_path)
+    w, h = info["width"], info["height"]
+    x, y, rw, rh = calc_corner_rect(w, h, corner)
+    x = max(2, min(w - rw - 2, x))
+    y = max(2, min(h - rh - 2, y))
+    out_mp4 = os.path.join(TMP_ROOT, f"clean_logo_{int(time.time()*1000)}.mp4")
+    cmd = [
+        "ffmpeg", "-y", "-i", video_path,
+        "-vf", f"delogo=x={x}:y={y}:w={rw}:h={rh}",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+        "-c:a", "copy", "-map_metadata", "-1", "-movflags", "+faststart",
+        out_mp4,
+    ]
+    run_ffmpeg(cmd)
+    return out_mp4
+
+
+# ==================== ۸. کارت مناسبت‌نگار روزانه ====================
 async def build_daily_occasion_card(session: aiohttp.ClientSession) -> tuple:
     jnow = jdatetime.datetime.fromgregorian(datetime=get_tehran_now())
     wd = JALALI_WEEKDAYS[jnow.weekday()]
@@ -1543,7 +2168,7 @@ async def build_daily_occasion_card(session: aiohttp.ClientSession) -> tuple:
     if not occasion and GEMINI_API_KEY:
         p = (
             f"امروز {full_date} هجری شمسی است. "
-            "فقط در یک جمله بسیار کوتاه (حداکثر ۱۰ کلمه) مهم‌ترین مناسبت رسمی یا فرهنگی امروز در ایران یا شیراز را بنویس "
+            "فقط در یک جمله بسیار کوتاه و بدون ایموجی (حداکثر ۱۰ کلمه) مهم‌ترین مناسبت رسمی یا فرهنگی امروز در ایران یا شیراز را بنویس "
             "(اگر مناسبت خاصی نیست، یک جمله کوتاه و باوقار صبح‌بخیر شیراز بنویس). بدون توضیح اضافه."
         )
         occasion = await gemini_generate(session, p)
@@ -1569,20 +2194,15 @@ async def build_daily_occasion_card(session: aiohttp.ClientSession) -> tuple:
         draw_rtl_text(d, (w // 2, 1020), f"{wd}  |  {month_str} {year_str}", load_font("display", 72), theme["text"], align="center")
 
         d.line([(200, 1150), (w - 200, 1150)], fill=theme["accent"], width=4)
-        f_occ = load_font("bold", 46)
-        lines = wrap_persian_lines(d, occasion, f_occ, w - 220, max_lines=3)
-        oy = 1220
-        for ln in lines:
-            draw_rtl_text(d, (w // 2, oy), ln, f_occ, theme["subtext"], align="center")
-            oy += 72
-
+        draw_centered_block_in_box(d, (110, 1190, w - 110, 1520), occasion, "bold", theme["subtext"], max_size=46, min_size=28, max_lines=3, align="center")
         draw_rtl_text(d, (w // 2, 1620), BRAND_HANDLE, load_font("bold", 42), theme["accent"], align="center", is_rtl=False)
+
         out = os.path.join(TMP_ROOT, f"occasion_{int(time.time()*1000)}.jpg")
         im.save(out, quality=94)
         return out
 
     card_path = await asyncio.to_thread(draw_card)
-    caption = f"📅 {full_date}\n\n{occasion}\n\n🔔 {BRAND_HANDLE}"
+    caption = f"📅 {full_date}\n\n{strip_emojis_for_font(occasion)}\n\n🔔 {BRAND_HANDLE}"
     return card_path, caption
     # ==================== ارسال کپشن + سپر ضدشدوبن ====================
 async def send_caption_with_shield(session: aiohttp.ClientSession, chat_id: str, caption: str):
@@ -1600,7 +2220,7 @@ async def send_caption_with_shield(session: aiohttp.ClientSession, chat_id: str,
     await send_message(session, chat_id, caption, kb_main_menu())
 
 
-# ==================== اجرای کارهای ویدئویی در پس‌زمینه ====================
+# ==================== اجرای کارهای ویدئویی و پردازشی در پس‌زمینه ====================
 async def run_daily60_job(session: aiohttp.ClientSession, chat_id: str):
     try:
         items_copy = list(DAILY_ITEMS[-6:])
@@ -1617,9 +2237,7 @@ async def run_daily60_job(session: aiohttp.ClientSession, chat_id: str):
 
 async def run_incident_job(session: aiohttp.ClientSession, chat_id: str, photo_path: str, news_text: str):
     try:
-        _, hl = await extract_short_headline(session, news_text, is_incident=True)
-        mp4 = await asyncio.to_thread(build_incident_reel_sync, photo_path, hl)
-        await send_video_file(session, chat_id, mp4, caption="🚨 ریلز فوری و حادثه‌ای آماده انتشار است.")
+        # ابتدا کپشن تولید می‌شود تا حتی اگر متن کوتاه یا خالی بود، تیتر و زیرتیتر کامل داشته باشیم
         cap = await generate_editorial_caption(
             session,
             news_text=news_text,
@@ -1627,8 +2245,12 @@ async def run_incident_job(session: aiohttp.ClientSession, chat_id: str, photo_p
             mime_type="image/jpeg" if photo_path else None,
             force_incident=True,
         )
+        source_for_parts = news_text if len(news_text) >= 15 else cap
+        _, hl, sub = await extract_news_parts(session, source_for_parts, is_incident=True)
+        mp4 = await asyncio.to_thread(build_incident_reel_sync, photo_path, hl, sub)
+        await send_video_file(session, chat_id, mp4, caption="🚨 ریلز فوری و حادثه‌ای (شوک + آژیر + تایپ زنده + زیرنویس) آماده انتشار است.")
         await send_caption_with_shield(session, chat_id, cap)
-        add_to_daily_items(hl, photo_path, tag="فوری")
+        add_to_daily_items(hl, photo_path, tag="خبر فوری")
         if os.path.exists(mp4):
             os.remove(mp4)
     except Exception as e:
@@ -1637,17 +2259,24 @@ async def run_incident_job(session: aiohttp.ClientSession, chat_id: str, photo_p
 
 async def run_map_job(session: aiohttp.ClientSession, chat_id: str, loc_name: str, photo_path: str, news_text: str):
     try:
-        lat, lon, zoom = await resolve_location_coords(session, loc_name)
-        map_img = await fetch_dark_map_image(session, lat, lon, zoom)
-        _, hl = await extract_short_headline(session, news_text)
-        mp4 = await asyncio.to_thread(build_map_zoom_reel_sync, map_img, photo_path, loc_name, hl)
-        await send_video_file(session, chat_id, mp4, caption=f"🗺️ ریلز زوم نقشه ({loc_name}) آماده است.")
+        lat, lon, close_zoom = await resolve_location_coords(session, loc_name)
+        wide_zoom = max(7, close_zoom - 3)
+        wide_map, close_map = await asyncio.gather(
+            fetch_reliable_map_image(session, lat, lon, wide_zoom),
+            fetch_reliable_map_image(session, lat, lon, close_zoom),
+        )
         cap = await generate_editorial_caption(
             session,
             news_text=f"موقعیت خبر: {loc_name}\n{news_text}",
             media_path=photo_path or None,
             mime_type="image/jpeg" if photo_path else None,
         )
+        source_for_parts = news_text if len(news_text) >= 15 else cap
+        badge, hl, sub = await extract_news_parts(session, source_for_parts)
+        mp4 = await asyncio.to_thread(
+            build_map_zoom_reel_sync, wide_map, close_map, photo_path, loc_name, badge, hl, sub
+        )
+        await send_video_file(session, chat_id, mp4, caption=f"🗺️ ریلز زوم دومرحله‌ای روی نقشه «{loc_name}» آماده است.")
         await send_caption_with_shield(session, chat_id, cap)
         add_to_daily_items(hl, photo_path, tag=loc_name)
         if os.path.exists(mp4):
@@ -1656,18 +2285,20 @@ async def run_map_job(session: aiohttp.ClientSession, chat_id: str, loc_name: st
         await send_message(session, chat_id, f"⚠️ خطا در ساخت ریلز نقشه:\n{e}", kb_main_menu())
 
 
-async def run_audiogram_job(session: aiohttp.ClientSession, chat_id: str, audio_path: str, speaker_photo: str, headline: str):
+async def run_audiogram_job(session: aiohttp.ClientSession, chat_id: str, audio_path: str, speaker_photo: str, raw_title: str):
     try:
-        mp4 = await asyncio.to_thread(build_audiogram_reel_sync, audio_path, headline, speaker_photo)
-        await send_video_file(session, chat_id, mp4, caption="🎙️ ریلز موج صوتی آماده است.")
         cap = await generate_editorial_caption(
             session,
-            news_text=f"تیتر گزارش صوتی: {headline}",
+            news_text=f"تیتر گزارش صوتی: {raw_title}",
             media_path=audio_path,
             mime_type="audio/ogg",
         )
+        source_for_parts = raw_title if len(raw_title) >= 15 else cap
+        badge, hl, sub = await extract_news_parts(session, source_for_parts)
+        mp4 = await asyncio.to_thread(build_audiogram_reel_sync, audio_path, badge or "گزارش صوتی", hl, sub, speaker_photo)
+        await send_video_file(session, chat_id, mp4, caption="🎙️ ریلز موج صوتی آماده است.")
         await send_caption_with_shield(session, chat_id, cap)
-        add_to_daily_items(headline, speaker_photo, tag="صوتی")
+        add_to_daily_items(hl, speaker_photo, tag="صوتی")
         if os.path.exists(mp4):
             os.remove(mp4)
     except Exception as e:
@@ -1676,18 +2307,47 @@ async def run_audiogram_job(session: aiohttp.ClientSession, chat_id: str, audio_
 
 async def run_video_studio_job(session: aiohttp.ClientSession, chat_id: str, vid_path: str, user_caption: str):
     try:
-        out_mp4, applied = await asyncio.to_thread(process_video_studio_sync, vid_path)
-        summary = "🎞️ ویدئو با موفقیت تدوین شد:\n" + "\n".join(f"• {a}" for a in applied)
-        await send_video_file(session, chat_id, out_mp4, caption=summary)
+        # ابتدا کپشن از روی خود فیلم و متن کاربر تولید می‌شود تا هر ۳ باکس قاب ریلز دقیق پر شوند
         cap = await generate_editorial_caption(session, news_text=user_caption, media_path=vid_path, mime_type="video/mp4")
+        source_for_parts = user_caption if len(user_caption) >= 15 else cap
+        badge, hl, sub = await extract_news_parts(session, source_for_parts)
+        out_mp4, applied = await asyncio.to_thread(process_video_studio_sync, vid_path, badge, hl, sub)
+        summary = (
+            "🎞️ ویدئو با موفقیت تدوین شد:\n"
+            + "\n".join(f"• {a}" for a in applied)
+            + f"\n\n🏷️ برچسب باکس قرمز: {badge}\n📝 تیتر باکس میانی: {hl}"
+        )
+        await send_video_file(session, chat_id, out_mp4, caption=summary)
         await send_caption_with_shield(session, chat_id, cap)
+        add_to_daily_items(hl, None, tag=badge)
         if os.path.exists(out_mp4):
             os.remove(out_mp4)
     except Exception as e:
         await send_message(session, chat_id, f"⚠️ خطا در پردازش ویدئو:\n{e}", kb_main_menu())
 
 
-# ==================== مدیریت کامل دکمه‌های منوی پایین صفحه و پیام‌ها ====================
+async def run_clean_logo_job(session: aiohttp.ClientSession, chat_id: str, media_path: str, is_video: bool, corner: str):
+    corner_names = {
+        "tr": "بالا راست",
+        "tl": "بالا چپ",
+        "br": "پایین راست",
+        "bl": "پایین چپ",
+    }
+    cname = corner_names.get(corner, corner)
+    try:
+        if is_video:
+            out_p = await asyncio.to_thread(clean_corner_logo_video_sync, media_path, corner)
+            await send_video_file(session, chat_id, out_p, caption=f"🧹 لوگوی گوشه «{cname}» از روی ویدئو پاک‌سازی شد.", reply_markup=kb_main_menu())
+        else:
+            out_p = await asyncio.to_thread(clean_corner_logo_photo_sync, media_path, corner)
+            await send_photo_file(session, chat_id, out_p, caption=f"🧹 لوگوی گوشه «{cname}» از روی عکس پاک‌سازی شد.", reply_markup=kb_main_menu())
+        if os.path.exists(out_p):
+            os.remove(out_p)
+    except Exception as e:
+        await send_message(session, chat_id, f"⚠️ خطا در حذف واترمارک:\n{e}", kb_main_menu())
+
+
+# ==================== مدیریت کامل دکمه‌های منوی ثابت پایین صفحه ====================
 async def handle_message(session: aiohttp.ClientSession, msg: dict):
     chat_id = str(msg["chat"]["id"])
     from_id = str(msg.get("from", {}).get("id", chat_id))
@@ -1721,15 +2381,19 @@ async def handle_message(session: aiohttp.ClientSession, msg: dict):
         await send_message(session, chat_id, safe, kb_main_menu())
         return
 
-    # --- دکمه‌های منوی اصلی پایین صفحه ---
+    # --- دکمه‌های منوی اصلی ---
     if is_pure_text and text in (BTN_CARD_POST, BTN_CARD_STORY):
         fmt = "post" if text == BTN_CARD_POST else "story"
         fmt_fa = "پست (۴:۵)" if fmt == "post" else "استوری (۹:۱۶)"
+        extra_note = ""
+        if fmt == "story":
+            sf = find_repo_story_frame()
+            extra_note = f"\n📱 قالب فعال: {os.path.basename(sf)} ✅" if sf else "\n📱 قالب پیش‌فرض (برای قالب پیج فایل story_frame.png را آپلود کنید)"
         USER_STATE[chat_id] = {"mode": "card", "step": "wait_input", "fmt": fmt}
         await send_message(
             session,
             chat_id,
-            f"🖼️ ساخت کارت {fmt_fa}\n\nعکس خبر را همراه با متن خبر بفرستید (یا فقط متن بفرستید):",
+            f"🖼️ ساخت کارت {fmt_fa}{extra_note}\n\nعکس خبر را همراه با متن خبر بفرستید (یا فقط متن بفرستید):",
             kb_cancel(),
         )
         return
@@ -1739,7 +2403,10 @@ async def handle_message(session: aiohttp.ClientSession, msg: dict):
         await send_message(
             session,
             chat_id,
-            "🚨 ساخت ریلز فوری و حادثه‌ای (قالب اضطراری قرمز-مشکی + نور آژیر)\n\n"
+            "🚨 ریلز فوری و حادثه‌ای (نسخه اضطراری)\n"
+            "• قلاب ۱.۵ ثانیه‌ای شوک + لرزش دوربین\n"
+            "• آژیر اورژانسی واقعی + چراغ گردان قرمز/آبی\n"
+            "• تایپ زنده کلمه‌به‌کلمه تیتر + زیرنویس متحرک شبکه خبر\n\n"
             "عکس حادثه را همراه با متن خبر بفرستید:",
             kb_cancel(),
         )
@@ -1765,8 +2432,8 @@ async def handle_message(session: aiohttp.ClientSession, msg: dict):
         await send_message(
             session,
             chat_id,
-            "🗺️ ریلز زوم سینمایی روی نقشه\n\n"
-            "مرحله ۱ از ۲: نام محله در شیراز یا شهر استان فارس را بنویسید (مثلاً: معالی‌آباد، صدرا، مرودشت):",
+            "🗺️ ریلز زوم دومرحله‌ای روی نقشه واقعی\n\n"
+            "مرحله ۱ از ۲: نام محله در شیراز یا شهر استان فارس را بنویسید (مثلاً: معالی‌آباد، صدرا، بلوار چمران، مرودشت):",
             kb_cancel(),
         )
         return
@@ -1796,15 +2463,26 @@ async def handle_message(session: aiohttp.ClientSession, msg: dict):
 
     if is_pure_text and text == BTN_VIDEO:
         USER_STATE[chat_id] = {"mode": "video_studio", "step": "wait_video"}
-        repo_fr = find_repo_reel_frame()
-        fr_note = f"فایل شناسایی‌شده: {os.path.basename(repo_fr)}" if repo_fr else "فایل reel_frame.png هنوز آپلود نشده"
+        r_fr = find_repo_reel_frame()
+        fr_note = f"فعال ✅ ({os.path.basename(r_fr)}) — پر کردن خودکار ۳ باکس" if r_fr else "آپلود نشده (reel_frame.png)"
         await send_message(
             session,
             chat_id,
             "🎞️ استودیو تدوین هوشمند ویدئو\n\n"
-            f"• قاب ریلز مخزن: {fr_note}\n"
-            "• گزینه‌ها را از منوی پایین روشن/خاموش کنید و سپس ویدئوی خود را (زیر ۲۰ مگابایت) مستقیم بفرستید:",
+            f"• قاب ریلز ۳ باکسه: {fr_note}\n"
+            "• گزینه‌ها را از منوی پایین تنظیم کنید و سپس **ویدئوی خود را (ترجیحاً با متن خبر در کپشن)** بفرستید:",
             kb_video_studio(),
+        )
+        return
+
+    if is_pure_text and text == BTN_CLEAN_LOGO:
+        USER_STATE[chat_id] = {"mode": "clean_logo", "step": "wait_corner"}
+        await send_message(
+            session,
+            chat_id,
+            "🧹 حذف واترمارک و لوگوی خبرگزاری‌ها\n\n"
+            "مرحله ۱ از ۲: لوگوی مزاحم در کدام گوشه عکس یا فیلم قرار دارد؟ از منوی پایین انتخاب کنید:",
+            kb_logo_corners(),
         )
         return
 
@@ -1824,7 +2502,7 @@ async def handle_message(session: aiohttp.ClientSession, msg: dict):
         await send_message(
             session,
             chat_id,
-            f"🎨 تغییر آنی تم گرافیکی\n\nتم فعال فعلی: {cur}\nتم جدید را از منوی پایین صفحه انتخاب کنید:",
+            f"🎨 تغییر آنی تم گرافیکی\n\nتم فعال فعلی: {cur}\nتم جدید را از منوی پایین انتخاب کنید:",
             kb_theme_menu(),
         )
         return
@@ -1835,7 +2513,7 @@ async def handle_message(session: aiohttp.ClientSession, msg: dict):
         await send_photo_file(session, chat_id, card_p, caption=cap, reply_markup=kb_main_menu())
         return
 
-    # --- زیرمنوی انتخاب تم گرافیکی ---
+    # --- زیرمنوی انتخاب تم ---
     if is_pure_text:
         for tkey, tval in THEMES.items():
             if text == tval["btn"]:
@@ -1846,9 +2524,18 @@ async def handle_message(session: aiohttp.ClientSession, msg: dict):
                 return
 
     # --- زیرمنوی تنظیمات استودیو ویدئو ---
-    if is_pure_text and text.startswith(("🖼️ قاب ریلز مخزن:", "🧬 اصالت‌سازی", "👤 ردیابی چهره", "🏷️ اند-اسکرین")):
-        if text.startswith("🖼️ قاب ریلز مخزن:"):
+    if is_pure_text and text.startswith((
+        "🖼️ قاب ریلز", "📱 قاب استوری", "⚡ قلاب شوک", "📰 زیرنویس متحرک",
+        "🧬 اصالت‌سازی", "👤 ردیابی چهره", "🏷️ اند-اسکرین"
+    )):
+        if text.startswith("🖼️ قاب ریلز"):
             CONFIG["use_repo_frame"] = not CONFIG["use_repo_frame"]
+        elif text.startswith("📱 قاب استوری"):
+            CONFIG["use_story_frame"] = not CONFIG["use_story_frame"]
+        elif text.startswith("⚡ قلاب شوک"):
+            CONFIG["video_hook_intro"] = not CONFIG["video_hook_intro"]
+        elif text.startswith("📰 زیرنویس متحرک"):
+            CONFIG["video_ticker"] = not CONFIG["video_ticker"]
         elif text.startswith("🧬 اصالت‌سازی"):
             CONFIG["video_antidup"] = not CONFIG["video_antidup"]
         elif text.startswith("👤 ردیابی چهره"):
@@ -1857,10 +2544,10 @@ async def handle_message(session: aiohttp.ClientSession, msg: dict):
             CONFIG["video_brand"] = not CONFIG["video_brand"]
         await save_config_to_pin(session)
         USER_STATE[chat_id] = {"mode": "video_studio", "step": "wait_video"}
-        await send_message(session, chat_id, "✅ تنظیم ذخیره شد. حالا ویدئوی خود را بفرستید:", kb_video_studio())
+        await send_message(session, chat_id, "✅ تنظیم ذخیره شد. حالا ویدئوی خود را (با متن خبر در کپشن) بفرستید:", kb_video_studio())
         return
 
-    # --- پردازش ورودی‌های کاربر در هر حالت ---
+    # --- پردازش ورودی‌های هر حالت ---
     state = USER_STATE.get(chat_id)
     if not state:
         await send_message(session, chat_id, build_status_text(), kb_main_menu())
@@ -1879,15 +2566,16 @@ async def handle_message(session: aiohttp.ClientSession, msg: dict):
             return
 
         await send_message(session, chat_id, "⏳ در حال طراحی کارت گرافیکی و نگارش کپشن ۶ بخشی...")
-        badge, hl = await extract_short_headline(session, text)
-        card_p = await asyncio.to_thread(render_news_card_sync, photo_path, badge, hl, "", fmt, CONFIG["theme"])
-        await send_photo_file(session, chat_id, card_p, caption="🖼️ کارت آماده انتشار")
         cap = await generate_editorial_caption(
             session,
             news_text=text,
             media_path=photo_path or None,
             mime_type="image/jpeg" if photo_path else None,
         )
+        source_for_parts = text if len(text) >= 15 else cap
+        badge, hl, sub = await extract_news_parts(session, source_for_parts)
+        card_p = await asyncio.to_thread(render_news_card_sync, photo_path, badge, hl, sub, fmt, CONFIG["theme"])
+        await send_photo_file(session, chat_id, card_p, caption="🖼️ کارت آماده انتشار")
         await send_caption_with_shield(session, chat_id, cap)
         add_to_daily_items(hl, photo_path, tag=badge)
         return
@@ -1900,7 +2588,7 @@ async def handle_message(session: aiohttp.ClientSession, msg: dict):
         if not photo_path and not text:
             await send_message(session, chat_id, "❌ عکس و متن خبر حادثه‌ای را بفرستید.", kb_main_menu())
             return
-        await send_message(session, chat_id, "🚨 در حال ساخت ریلز اضطراری حادثه‌ای (حدود ۲۰ ثانیه)...", kb_main_menu())
+        await send_message(session, chat_id, "🚨 در حال تدوین ریلز اضطراری حادثه‌ای (حدود ۲۵ تا ۴۰ ثانیه)...", kb_main_menu())
         spawn_bg_task(run_incident_job(session, chat_id, photo_path, text))
         return
 
@@ -1965,7 +2653,7 @@ async def handle_message(session: aiohttp.ClientSession, msg: dict):
             photo_path = ""
             if msg.get("photo"):
                 photo_path = await download_tg_file(session, msg["photo"][-1]["file_id"], ".jpg")
-            await send_message(session, chat_id, f"🗺️ در حال دریافت نقشه «{loc}» و ساخت ریلز زوم سینمایی...", kb_main_menu())
+            await send_message(session, chat_id, f"🗺️ در حال دریافت نقشه واقعی «{loc}» و ساخت ریلز زوم دومرحله‌ای...", kb_main_menu())
             spawn_bg_task(run_map_job(session, chat_id, loc, photo_path, text))
             return
 
@@ -2024,10 +2712,52 @@ async def handle_message(session: aiohttp.ClientSession, msg: dict):
             await send_message(session, chat_id, "⚠️ حجم ویدئو بالای ۲۰ مگابایت است. نسخه کم‌حجم‌تر بفرستید.", kb_video_studio())
             return
         USER_STATE.pop(chat_id, None)
-        await send_message(session, chat_id, "🎞️ در حال تدوین هوشمند ویدئو و اعمال قاب ریلز (حدود ۳۰ تا ۶۰ ثانیه)...", kb_main_menu())
+        await send_message(session, chat_id, "🎞️ در حال تحلیل فیلم، پر کردن ۳ باکس قاب ریلز و تدوین هوشمند (۳۰ تا ۶۰ ثانیه)...", kb_main_menu())
         vid_path = await download_tg_file(session, vid["file_id"], ".mp4")
         spawn_bg_task(run_video_studio_job(session, chat_id, vid_path, text))
         return
+
+    if mode == "clean_logo":
+        corner_map = {
+            BTN_CORNER_TR: "tr",
+            BTN_CORNER_TL: "tl",
+            BTN_CORNER_BR: "br",
+            BTN_CORNER_BL: "bl",
+        }
+        if state["step"] == "wait_corner":
+            if is_pure_text and text in corner_map:
+                state["corner"] = corner_map[text]
+                state["step"] = "wait_media"
+                await send_message(
+                    session,
+                    chat_id,
+                    f"✅ موقعیت لوگو ثبت شد: {text}\n\nمرحله ۲ از ۲: حالا عکس یا فیلم (زیر ۲۰ مگابایت) را بفرستید:",
+                    kb_cancel(),
+                )
+                return
+            await send_message(session, chat_id, "❌ یکی از ۴ گوشه را از منوی پایین انتخاب کنید:", kb_logo_corners())
+            return
+
+        if state["step"] == "wait_media":
+            corner = state["corner"]
+            if msg.get("video"):
+                vid = msg["video"]
+                if vid.get("file_size", 0) > 19.5 * 1024 * 1024:
+                    await send_message(session, chat_id, "⚠️ حجم فیلم باید کمتر از ۲۰ مگابایت باشد.", kb_cancel())
+                    return
+                USER_STATE.pop(chat_id, None)
+                await send_message(session, chat_id, "🧹 در حال حذف واترمارک از روی ویدئو...", kb_main_menu())
+                m_path = await download_tg_file(session, vid["file_id"], ".mp4")
+                spawn_bg_task(run_clean_logo_job(session, chat_id, m_path, True, corner))
+                return
+            if msg.get("photo"):
+                USER_STATE.pop(chat_id, None)
+                await send_message(session, chat_id, "🧹 در حال حذف واترمارک از روی عکس...", kb_main_menu())
+                m_path = await download_tg_file(session, msg["photo"][-1]["file_id"], ".jpg")
+                spawn_bg_task(run_clean_logo_job(session, chat_id, m_path, False, corner))
+                return
+            await send_message(session, chat_id, "❌ لطفاً عکس یا ویدئو بفرستید:", kb_cancel())
+            return
 
     if mode == "shadowban_check":
         USER_STATE.pop(chat_id, None)
