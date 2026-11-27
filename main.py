@@ -212,6 +212,8 @@ DEFAULT_PRONUNCIATION_DICT = {
     "لامرد": "لامِرد",
     "سپیدان": "سِپیدان",
     "ممسنی": "مَمَسَنی",
+    "شهرستان ممسنی": "شَهرِستانِ مَمَسَنی",
+    "نورآباد ممسنی": "نورآبادِ مَمَسَنی",
     "اقلید": "اِقلید",
     "آباده": "آبادِه",
     "استهبان": "اِستَهبان",
@@ -826,6 +828,15 @@ def check_shadowban_words(text: str) -> list:
     return [(w, alt) for w, alt in SENSITIVE_WORDS.items() if w in text]
 
 
+def smart_truncate_words(text: str, max_chars: int = 96) -> str:
+    """کوتاه‌سازی ایمن متن روی مرز کلمه (هرگز وسط کلمه برش نمی‌زند)."""
+    t = re.sub(r"\s+", " ", (text or "")).strip()
+    if len(t) <= max_chars:
+        return t
+    cut = t[:max_chars].rsplit(" ", 1)[0].strip(" ،؛:-—/")
+    return cut if len(cut) >= max_chars // 2 else t[:max_chars].strip()
+
+
 def add_to_daily_items(headline: str, photo_path: str = None, tag: str = "خبر"):
     clean_hl = strip_emojis_for_font(headline)
     if "|" in clean_hl:
@@ -838,7 +849,7 @@ def add_to_daily_items(headline: str, photo_path: str = None, tag: str = "خبر
         except Exception:
             saved_img = None
     DAILY_ITEMS.append({
-        "headline": clean_hl[:110],
+        "headline": smart_truncate_words(clean_hl, 108),
         "photo": saved_img,
         "tag": strip_emojis_for_font(tag) or "شیراز",
         "time": get_tehran_now().strftime("%H:%M"),
@@ -1275,14 +1286,15 @@ async def _tts_via_elevenlabs(session: aiohttp.ClientSession, text: str, raw_out
 
 
 async def _tts_via_gemini_native(session: aiohttp.ClientSession, text: str, raw_wav_out: str, is_female: bool = False) -> bool:
-    """موتور صوتی اختصاصی Gemini Native TTS (کاملاً متمایز از صدای تکراری Edge-TTS)."""
+    """موتور صوتی اختصاصی Gemini Native TTS با مدیریت هوشمند صف و محدودیت 429 برای صدای ۱۰۰٪ یکدست."""
     if not GEMINI_API_KEY:
         return False
     voice_name = "Kore" if is_female else "Charon"
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key={GEMINI_API_KEY}"
     styled_prompt = (
-        "Read the following Persian news bulletin in an energetic, clear, authoritative Iranian TV news anchor voice, "
-        "with crisp Persian articulation, natural phrasing, and confident pacing:\n"
+        "Read this Persian TV news bulletin in a crisp, natural, energetic Iranian news anchor voice. "
+        "Pronounce every Persian word and Fars province place name accurately according to the diacritics "
+        "(e.g. Mamasani = مَمَسَنی, Beyza = بَیضا, khabar = خَبَر), with confident pacing and zero hesitation:\n"
         f"{text}"
     )
     body = {
@@ -1292,12 +1304,23 @@ async def _tts_via_gemini_native(session: aiohttp.ClientSession, text: str, raw_
             "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice_name}}},
         },
     }
-    for attempt in range(2):
+    backoffs = [8.0, 16.0, 26.0, 35.0]
+    for attempt in range(len(backoffs) + 1):
         try:
-            async with session.post(url, json=body, timeout=aiohttp.ClientTimeout(total=45)) as resp:
-                if resp.status == 429 and attempt == 0:
-                    await asyncio.sleep(4.5)
-                    continue
+            async with session.post(url, json=body, timeout=aiohttp.ClientTimeout(total=50)) as resp:
+                if resp.status in (429, 503):
+                    if attempt < len(backoffs):
+                        wait_s = backoffs[attempt]
+                        try:
+                            err_txt = await resp.text()
+                            rm = re.search(r"retryDelay\"\s*:\s*\"(\d+(?:\.\d+)?)s", err_txt)
+                            if rm:
+                                wait_s = min(45.0, float(rm.group(1)) + 1.5)
+                        except Exception:
+                            pass
+                        await asyncio.sleep(wait_s)
+                        continue
+                    return False
                 if resp.status != 200:
                     return False
                 data = await resp.json()
@@ -1324,28 +1347,35 @@ async def _tts_via_gemini_native(session: aiohttp.ClientSession, text: str, raw_
                             wf.writeframes(raw_bytes)
                         return True
         except Exception:
-            if attempt == 0:
-                await asyncio.sleep(1.5)
+            if attempt < 2:
+                await asyncio.sleep(2.5)
     return False
 
 
-async def synthesize_broadcast_tts(session: aiohttp.ClientSession, raw_text: str, out_wav: str, work_dir: str, already_diacritized: bool = False) -> tuple:
-    """تولید صدای اختصاصی گوینده خبری: اولویت ۱ ElevenLabs، اولویت ۲ Gemini Native TTS، اولویت ۳ پشتیبان."""
+async def synthesize_broadcast_tts(
+    session: aiohttp.ClientSession,
+    raw_text: str,
+    out_wav: str,
+    work_dir: str,
+    already_diacritized: bool = False,
+    lock_engine: str = "",
+) -> tuple:
+    """تولید صدای یکدست گوینده خبری با قفل موتور صوتی (هرگز وسط ویدیو صدای گوینده عوض نمی‌شود)."""
     diac_text = apply_pronunciation_dict(raw_text) if already_diacritized else await diacritize_persian_for_tts(session, raw_text)
     is_female = CONFIG.get("tts_profile") == "studio_anchor_f"
     raw_in = os.path.join(work_dir, f"tts_src_{int(time.time()*1000)}_{random.randint(10,99)}.wav")
     engine_used = ""
 
-    # ۱. ElevenLabs (اگر کلید تنظیم شده باشد)
-    if ELEVENLABS_API_KEY and await _tts_via_elevenlabs(session, diac_text, raw_in):
-        engine_used = "ElevenLabs"
+    # اگر موتور قفل شده، فقط از همان موتور برای تمام اسلایدها استفاده می‌کنیم تا صدا دوگانه نشود
+    if (not lock_engine or lock_engine == "ElevenLabs") and ELEVENLABS_API_KEY:
+        if await _tts_via_elevenlabs(session, diac_text, raw_in):
+            engine_used = "ElevenLabs"
 
-    # ۲. Gemini Native TTS (صدای اختصاصی، پرانرژی و غیرتکراری با همان کلید Gemini)
-    if not engine_used and GEMINI_API_KEY and await _tts_via_gemini_native(session, diac_text, raw_in, is_female=is_female):
-        engine_used = "Gemini TTS"
+    if not engine_used and (not lock_engine or lock_engine == "Gemini TTS") and GEMINI_API_KEY:
+        if await _tts_via_gemini_native(session, diac_text, raw_in, is_female=is_female):
+            engine_used = "Gemini TTS"
 
-    # ۳. پشتیبان اضطراری (فقط در صورت اختلال موقت دو موتور بالا)
-    if not engine_used and HAS_EDGE_TTS and edge_tts is not None:
+    if not engine_used and (not lock_engine or lock_engine == "پشتیبان صوتی") and HAS_EDGE_TTS and edge_tts is not None:
         raw_mp3 = os.path.join(work_dir, f"tts_fb_{int(time.time()*1000)}_{random.randint(10,99)}.mp3")
         v_name = "fa-IR-DilaraNeural" if is_female else "fa-IR-FaridNeural"
         try:
@@ -1359,10 +1389,9 @@ async def synthesize_broadcast_tts(session: aiohttp.ClientSession, raw_text: str
     if not engine_used or not os.path.exists(raw_in):
         return 0.0, ""
 
-    # مسترینگ تمیز و طبیعی رادیویی (بدون تغییر مصنوعی گام و بدون بم شدن صدا) + برش سکوت‌های اضافه ابتدا/انتها
     dsp_chain = (
         "aresample=44100,"
-        "silenceremove=start_periods=1:start_duration=0.05:start_threshold=-42dB,"
+        "silenceremove=start_periods=1:start_duration=0.04:start_threshold=-42dB,"
         "highpass=f=90,"
         "equalizer=f=240:t=q:w=1.2:g=-1.8,"
         "equalizer=f=3200:t=q:w=1.3:g=2.0,"
@@ -1711,18 +1740,23 @@ async def gemini_generate(session: aiohttp.ClientSession, prompt: str, media_pat
         if not model or model in tried:
             continue
         tried.append(model)
-        url = f"[https://generativelanguage.googleapis.com/v1beta/models/](https://generativelanguage.googleapis.com/v1beta/models/){model}:generateContent?key={GEMINI_API_KEY}"
-        try:
-            async with session.post(url, json=body, timeout=aiohttp.ClientTimeout(total=90)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    cands = data.get("candidates", [])
-                    if cands:
-                        out = "".join(p.get("text", "") for p in cands[0].get("content", {}).get("parts", [])).strip()
-                        if out:
-                            return clean_caption_markdown(out)
-        except Exception:
-            continue
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
+        for attempt in range(2):
+            try:
+                async with session.post(url, json=body, timeout=aiohttp.ClientTimeout(total=90)) as resp:
+                    if resp.status in (429, 503) and attempt == 0:
+                        await asyncio.sleep(5.5)
+                        continue
+                    if resp.status == 200:
+                        data = await resp.json()
+                        cands = data.get("candidates", [])
+                        if cands:
+                            out = "".join(p.get("text", "") for p in cands[0].get("content", {}).get("parts", [])).strip()
+                            if out:
+                                return clean_caption_markdown(out)
+                    break
+            except Exception:
+                break
     return ""
 
 
@@ -2324,8 +2358,7 @@ def build_map_zoom_reel_sync(wide_map: Image.Image, close_map: Image.Image, phot
     return out_mp4
 
 
-# ==================== ۴. موتور ۶ سبکی ریلز جمع‌بندی (بدون قلاب کاغذ سوخته) ====================
-# ==================== ۴. موتور وایرال ۶ سبکی ریلز جمع‌بندی (گویندگی اختصاصی فقط در سبک ۶) ====================
+# ==================== ۴. موتور وایرال ۶ سبکی ریلز جمع‌بندی (گویندگی یکدست Gemini TTS فقط در سبک ۶) ====================
 def build_mastered_reel_audio_sync(
     work_dir: str,
     total_sec: float,
@@ -2333,7 +2366,7 @@ def build_mastered_reel_audio_sync(
     mode: str = "news",
     voice_wav: str = "",
 ) -> tuple:
-    """مسترینگ صدای ریلز: میکس موزیک پس‌زمینه + افکت صوتی نرم کات (Whoosh SFX) + داکینگ خودکار زیر صدای گوینده + استخراج انرژی اکولایزر."""
+    """مسترینگ صدای ریلز: موزیک پس‌زمینه + افکت هوای سینمایی Whoosh (بدون صدای قطره آب) + داکینگ خودکار زیر صدای گوینده."""
     sr = 44100
     n_samples = max(sr, int(round(total_sec * sr)))
     bg_src = get_audio_track(work_dir, total_sec + 2.0, mode=mode)
@@ -2347,38 +2380,32 @@ def build_mastered_reel_audio_sync(
         with wave.open(path, "rb") as wf:
             raw = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16).astype(np.float32) / 32768.0
             ch = wf.getnchannels()
-        if ch == 1:
-            arr = np.stack([raw, raw], axis=-1)
-        else:
-            arr = raw.reshape(-1, ch)[:, :2]
+        arr = np.stack([raw, raw], axis=-1) if ch == 1 else raw.reshape(-1, ch)[:, :2]
         if len(arr) < target_n:
-            pad = np.zeros((target_n - len(arr), 2), dtype=np.float32)
-            arr = np.vstack([arr, pad])
+            arr = np.vstack([arr, np.zeros((target_n - len(arr), 2), dtype=np.float32)])
         return arr[:target_n]
 
     bg_arr = read_stereo_float(bg_wav, n_samples)
 
-    # ساخت افکت صوتی نرم «ووش + تیک خبری» (0.24 ثانیه) برای لحظه تغییر اسلایدها
-    w_len = int(0.24 * sr)
-    wt = np.linspace(0.0, 0.24, w_len, endpoint=False, dtype=np.float32)
+    # افکت صوتی حرفه‌ای Whoosh برودکست (فقط هوای گذرا + بیس بسیار نرم 68Hz به 40Hz؛ بدون هیچ صدای قطره آب)
+    w_len = int(0.28 * sr)
+    wt = np.linspace(0.0, 0.28, w_len, endpoint=False, dtype=np.float32)
     rng = np.random.default_rng(19)
-    noise = rng.normal(0.0, 1.0, w_len).astype(np.float32)
-    # فیلتر نرم روی نویز برای ساخت صدای هوای سینمایی (Whoosh)
-    kernel = np.ones(18, dtype=np.float32) / 18.0
-    whoosh_body = np.convolve(noise, kernel, mode="same")
-    env = np.sin(np.pi * (wt / 0.24)) ** 1.6
-    tick = 0.25 * np.sin(2.0 * np.pi * (480.0 - 240.0 * (wt / 0.24)) * wt) * np.exp(-wt * 22.0)
-    sfx_mono = (whoosh_body * env * 0.45 + tick) * 0.36
+    raw_n = rng.normal(0.0, 1.0, w_len).astype(np.float32)
+    lp_wide = np.convolve(raw_n, np.ones(26, dtype=np.float32) / 26.0, mode="same")
+    lp_narrow = np.convolve(raw_n, np.ones(110, dtype=np.float32) / 110.0, mode="same")
+    air_whoosh = (lp_wide - lp_narrow) * (np.sin(np.pi * (wt / 0.28)) ** 1.8) * 1.45
+    freq_sweep = 68.0 - 28.0 * (wt / 0.28)
+    sub_thump = 0.22 * np.sin(2.0 * np.pi * np.cumsum(freq_sweep) / sr) * np.exp(-wt * 14.0)
+    sfx_mono = (air_whoosh + sub_thump) * 0.34
     sfx_stereo = np.stack([sfx_mono, sfx_mono], axis=-1)
 
     if voice_wav and os.path.exists(voice_wav):
         v_arr = read_stereo_float(voice_wav, n_samples)
-        # داکینگ خودکار: وقتی گوینده صحبت می‌کند صدای موزیک نرم پایین می‌آید (18%) و در مکث/مقدمه/پایان بالا می‌رود (42%)
         v_abs = np.max(np.abs(v_arr), axis=1)
         win = int(0.18 * sr)
         v_env = np.convolve(v_abs, np.ones(win, dtype=np.float32) / win, mode="same")
-        duck_gain = np.where(v_env > 0.015, 0.17, 0.38).astype(np.float32)
-        # هموارسازی منحنی داکینگ تا هیچ پله صوتی شنیده نشود
+        duck_gain = np.where(v_env > 0.015, 0.16, 0.36).astype(np.float32)
         s_win = int(0.12 * sr)
         duck_gain = np.convolve(duck_gain, np.ones(s_win, dtype=np.float32) / s_win, mode="same")[:, None]
         mix = v_arr * 1.15 + bg_arr * duck_gain
@@ -2387,14 +2414,12 @@ def build_mastered_reel_audio_sync(
         mix = bg_arr * 0.68
         eq_source = np.max(np.abs(bg_arr), axis=1)
 
-    # تزریق دقیق افکت صوتی Whoosh روی تمام کات‌ها
     for ct in cut_times:
-        idx0 = int(max(0, (ct - 0.12) * sr))
+        idx0 = int(max(0, (ct - 0.14) * sr))
         idx1 = min(n_samples, idx0 + w_len)
         if idx1 > idx0:
             mix[idx0:idx1] += sfx_stereo[:idx1 - idx0]
 
-    # فید نرم ۰.۳۵ ثانیه پایانی
     fade_n = min(int(0.35 * sr), n_samples // 4)
     if fade_n > 0:
         mix[-fade_n:] *= np.linspace(1.0, 0.0, fade_n, dtype=np.float32)[:, None]
@@ -2408,7 +2433,6 @@ def build_mastered_reel_audio_sync(
         wf.setframerate(sr)
         wf.writeframes(pcm.tobytes())
 
-    # استخراج سطح انرژی لحظه‌ای فریم‌به‌فریم (25fps) برای اکولایزر زنده
     fps = 25
     n_frames = max(1, int(math.ceil(total_sec * fps)))
     hop = max(1, sr // fps)
@@ -2422,39 +2446,53 @@ def build_mastered_reel_audio_sync(
 
 
 async def prepare_hologram_narration_audio(session: aiohttp.ClientSession, items: list, editorial: dict, work_dir: str) -> dict:
-    """تولید گویندگی اختصاصی فارسی (فقط برای سبک ۶ هولوگرام) با موتور Gemini TTS و زمان‌بندی تند و بدون مکث مرده."""
+    """تولید گویندگی ۱۰۰٪ یکدست فارسی (فقط سبک ۶) با مقدمه سریع ۲ ثانیه‌ای و قفل کامل روی یک موتور صوتی."""
     ed_items = editorial.get("items") or []
     ordinals = ["خَبَرِ اوّل؛", "خَبَرِ دُوُم؛", "خَبَرِ سِوُم؛", "خَبَرِ چَهارُم؛", "خَبَرِ پَنجُم؛", "خَبَرِ شِشُم؛", "خَبَرِ هَفتُم؛", "خَبَرِ هَشتُم؛"]
 
-    scripts = ["خَبَرِ فوری! شَصت ثانیِه با مُهِم‌ترین اَخبارِ ایران و شیراز."]
+    # جمله مقدمه کوتاه و کوبنده تا اسلاید اول سریع (حدود ۲ تا ۲.۵ ثانیه) جمع شود
+    scripts = ["شَصت ثانیِه با مُهِم‌ترین اَخبار!"]
     for idx, ed in enumerate(ed_items):
         ord_p = ordinals[idx] if idx < len(ordinals) else f"خَبَرِ {idx + 1}؛"
         sp = apply_pronunciation_dict(ed.get("spoken_text") or ed.get("display_headline") or "")
         scripts.append(f"{ord_p} {sp}.")
-    scripts.append("بَرایِ پِیگیریِ مُهِم‌ترین خَبَرهایِ ایران و شیراز، آخَرین خَبَرهایِ شیراز را فالو کُنید.")
+    scripts.append("بَرایِ مُهِم‌ترین خَبَرهایِ ایران و شیراز فالو کُنید.")
 
     seg_wavs = []
     seg_durs = []
-    engines = set()
+    locked_engine = ""
+
+    # مکث کوتاه اولیه بعد از مرحله ویراستاری تا محدودیت لحظه‌ای Gemini فعال نشود
+    await asyncio.sleep(2.0)
+
     for k, sc_txt in enumerate(scripts):
         if k > 0:
-            await asyncio.sleep(0.35)
+            await asyncio.sleep(2.2 if locked_engine == "Gemini TTS" else 0.4)
         w_p = os.path.join(work_dir, f"nar_{k:02d}.wav")
-        dur, eng = await synthesize_broadcast_tts(session, sc_txt, w_p, work_dir, already_diacritized=True)
+        dur, eng = await synthesize_broadcast_tts(
+            session, sc_txt, w_p, work_dir,
+            already_diacritized=True, lock_engine=locked_engine,
+        )
+        # اگر موتور قفل شده بود و موقتاً خطا داد، یک بار دیگر بعد از ۱۸ ثانیه تلاش می‌کنیم تا صدا دوگانه نشود
+        if dur <= 0.3 and locked_engine == "Gemini TTS":
+            await asyncio.sleep(18.0)
+            dur, eng = await synthesize_broadcast_tts(
+                session, sc_txt, w_p, work_dir,
+                already_diacritized=True, lock_engine="Gemini TTS",
+            )
         if dur > 0.3 and os.path.exists(w_p):
-            engines.add(eng)
+            if not locked_engine:
+                locked_engine = eng
             padded = os.path.join(work_dir, f"nar_pad_{k:02d}.wav")
             if k == 0:
-                # مقدمه سریع و کوبنده (حداقل 1.8 ثانیه، بدون سکوت اضافی)
-                target_d = max(1.9, dur + 0.35)
-                delay_ms = 120
+                target_d = max(2.0, min(3.1, dur + 0.30))
+                delay_ms = 100
             elif k == len(scripts) - 1:
-                # پایان جمع‌وجور (بدون ۸ ثانیه سکوت!)
-                target_d = max(2.6, dur + 0.45)
-                delay_ms = 120
+                target_d = max(2.6, dur + 0.40)
+                delay_ms = 100
             else:
-                target_d = max(3.2, dur + 0.50)
-                delay_ms = 180
+                target_d = max(3.2, dur + 0.48)
+                delay_ms = 160
             run_ffmpeg([
                 "ffmpeg", "-y", "-i", w_p,
                 "-af", f"adelay={delay_ms}|{delay_ms},apad=whole_dur={target_d:.2f}",
@@ -2464,12 +2502,12 @@ async def prepare_hologram_narration_audio(session: aiohttp.ClientSession, items
             seg_durs.append(target_d)
         else:
             sil = os.path.join(work_dir, f"sil_{k:02d}.wav")
-            def_d = 1.9 if k == 0 else (2.6 if k == len(scripts) - 1 else 3.8)
+            def_d = 2.1 if k == 0 else (2.6 if k == len(scripts) - 1 else 3.8)
             run_ffmpeg(["ffmpeg", "-y", "-f", "lavfi", "-t", f"{def_d:.2f}", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100", sil])
             seg_wavs.append(sil)
             seg_durs.append(def_d)
 
-    if not engines:
+    if not locked_engine:
         return {"voice_wav": "", "durs": seg_durs, "narrated": False, "engine": ""}
 
     list_f = os.path.join(work_dir, "nar_list.txt")
@@ -2478,7 +2516,82 @@ async def prepare_hologram_narration_audio(session: aiohttp.ClientSession, items
             f.write(f"file '{sw}'\n")
     voice_full = os.path.join(work_dir, "voice_full.wav")
     run_ffmpeg(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_f, "-c", "copy", voice_full])
-    return {"voice_wav": voice_full, "durs": seg_durs, "narrated": True, "engine": " + ".join(sorted(engines))}
+    return {"voice_wav": voice_full, "durs": seg_durs, "narrated": True, "engine": locked_engine}
+
+
+def _tokenize_line_metrics(draw: ImageDraw.ImageDraw, words: list, font: ImageFont.FreeTypeFont, hw_norm: set, has_pill: bool):
+    """محاسبه دقیق پیکسل‌به‌پیکسل عرض کلمات + حاشیه باکس هایلایت (صفر درصد بیرون‌زدگی از کادر)."""
+    td_sp1, kw_sp = prepare_text_and_kwargs("ب ب", is_rtl=True)
+    td_sp0, _ = prepare_text_and_kwargs("بب", is_rtl=True)
+    bb1 = draw.textbbox((0, 0), td_sp1, font=font, **kw_sp)
+    bb0 = draw.textbbox((0, 0), td_sp0, font=font, **kw_sp)
+    sp_w = max(8, (bb1[2] - bb1[0]) - (bb0[2] - bb0[0]) + 4)
+
+    infos = []
+    for w_tok in words:
+        td, kw = prepare_text_and_kwargs(w_tok, is_rtl=True)
+        bb = draw.textbbox((0, 0), td, font=font, **kw)
+        w_w = max(4, bb[2] - bb[0])
+        clean_tok = re.sub(r"[،.؛:!؟«»\-—]", "", w_tok).strip()
+        is_hl = bool(clean_tok and (clean_tok in hw_norm or any(len(k) >= 3 and k in clean_tok for k in hw_norm)))
+        pad = 9 if (is_hl and has_pill) else 0
+        infos.append((td, kw, bb, w_w, is_hl, pad))
+    total_w = sum(x[3] + 2 * x[5] for x in infos) + sp_w * max(0, len(infos) - 1)
+    return infos, sp_w, total_w
+
+
+def fit_highlighted_text_in_box(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font_kind: str,
+    max_width: int,
+    max_height: int,
+    highlight_words: list,
+    has_pill: bool,
+    max_size: int = 58,
+    min_size: int = 24,
+    max_lines: int = 4,
+    line_spacing: float = 1.38,
+) -> tuple:
+    """خط‌شکنی و تنظیم خودکار سایز فونت با محاسبه واقعی عرض کادرهای هایلایت تا هیچ حرفی بریده نشود."""
+    clean = strip_emojis_for_font(text).replace("\n", " ")
+    all_words = [w for w in clean.split() if w]
+    hw_norm = {re.sub(r"[،.؛:!؟«»\-—]", "", str(k)).strip() for k in (highlight_words or []) if str(k).strip()}
+    if not all_words:
+        return load_font(font_kind, min_size), [], int(min_size * line_spacing)
+
+    for sz in range(max_size, min_size - 1, -2):
+        font = load_font(font_kind, sz)
+        lines, cur = [], []
+        for w_tok in all_words:
+            trial = cur + [w_tok]
+            _, _, tw = _tokenize_line_metrics(draw, trial, font, hw_norm, has_pill)
+            if tw <= max_width or not cur:
+                cur = trial
+            else:
+                lines.append(" ".join(cur))
+                cur = [w_tok]
+        if cur:
+            lines.append(" ".join(cur))
+        lh = int(sz * line_spacing)
+        if len(lines) <= max_lines and (len(lines) * lh) <= max_height:
+            # اطمینان از اینکه هیچ خط منفردی هم از max_width بیشتر نشده باشد
+            if all(_tokenize_line_metrics(draw, ln.split(), font, hw_norm, has_pill)[2] <= max_width for ln in lines):
+                return font, lines, lh
+
+    font = load_font(font_kind, min_size)
+    lines, cur = [], []
+    for w_tok in all_words:
+        trial = cur + [w_tok]
+        _, _, tw = _tokenize_line_metrics(draw, trial, font, hw_norm, has_pill)
+        if tw <= max_width or not cur:
+            cur = trial
+        else:
+            lines.append(" ".join(cur))
+            cur = [w_tok]
+    if cur:
+        lines.append(" ".join(cur))
+    return font, lines[:max_lines], int(min_size * line_spacing)
 
 
 def draw_highlighted_rtl_line(
@@ -2494,30 +2607,13 @@ def draw_highlighted_rtl_line(
     pill_bg: tuple = None,
     shadow: bool = True,
 ):
-    """چاپ خط فارسی با هایلایت رنگی کلمات کلیدی (بدون شکستگی حروف فارسی)."""
+    """چاپ خط فارسی با کادرهای هایلایت تمیز و محاسبه دقیق عرض بدون بیرون‌زدگی."""
     words = [w for w in line.split() if w]
     if not words:
         return
     hw_norm = {re.sub(r"[،.؛:!؟«»\-—]", "", str(k)).strip() for k in (highlight_words or []) if str(k).strip()}
+    w_infos, sp_w, total_w = _tokenize_line_metrics(draw, words, font, hw_norm, pill_bg is not None)
 
-    # محاسبه عرض دقیق هر کلمه و فاصله استاندارد
-    td_sp1, kw_sp = prepare_text_and_kwargs("ب ب", is_rtl=True)
-    td_sp0, _ = prepare_text_and_kwargs("بب", is_rtl=True)
-    bb1 = draw.textbbox((0, 0), td_sp1, font=font, **kw_sp)
-    bb0 = draw.textbbox((0, 0), td_sp0, font=font, **kw_sp)
-    sp_w = max(8, (bb1[2] - bb1[0]) - (bb0[2] - bb0[0]) + 4)
-
-    w_infos = []
-    for w_tok in words:
-        td, kw = prepare_text_and_kwargs(w_tok, is_rtl=True)
-        bb = draw.textbbox((0, 0), td, font=font, **kw)
-        w_w = max(4, bb[2] - bb[0])
-        w_h = max(12, bb[3] - bb[1])
-        clean_tok = re.sub(r"[،.؛:!؟«»\-—]", "", w_tok).strip()
-        is_hl = bool(clean_tok and (clean_tok in hw_norm or any(len(k) >= 3 and k in clean_tok for k in hw_norm)))
-        w_infos.append((td, kw, bb, w_w, w_h, is_hl))
-
-    total_w = sum(x[3] for x in w_infos) + sp_w * max(0, len(w_infos) - 1)
     if align == "center":
         cursor_x = anchor_x + total_w // 2
     elif align == "left":
@@ -2525,18 +2621,18 @@ def draw_highlighted_rtl_line(
     else:
         cursor_x = anchor_x
 
-    for td, kw, bb, w_w, w_h, is_hl in w_infos:
-        draw_x = cursor_x - bb[2]
+    for td, kw, bb, w_w, is_hl, pad in w_infos:
+        draw_x = (cursor_x - pad) - bb[2]
         if is_hl and pill_bg is not None:
             draw.rounded_rectangle(
-                [(draw_x + bb[0] - 8, y + bb[1] - 5), (draw_x + bb[2] + 8, y + bb[3] + 7)],
-                radius=10,
+                [(draw_x + bb[0] - pad, y + bb[1] - 5), (draw_x + bb[2] + pad, y + bb[3] + 7)],
+                radius=11,
                 fill=pill_bg,
             )
         if shadow:
-            draw.text((draw_x + 3, y + 3), td, font=font, fill=(0, 0, 0, 195), **kw)
+            draw.text((draw_x + 3, y + 3), td, font=font, fill=(0, 0, 0, 190), **kw)
         draw.text((draw_x, y), td, font=font, fill=(highlight_fill if is_hl else normal_fill), **kw)
-        cursor_x -= (w_w + sp_w)
+        cursor_x -= (w_w + 2 * pad + sp_w)
 
 
 def build_daily_summary_reel_sync(
@@ -2545,7 +2641,7 @@ def build_daily_summary_reel_sync(
     narration_plan: dict = None,
     editorial: dict = None,
 ) -> str:
-    """موتور وایرال ۶ سبکی با قلاب رگباری ۱.۵ ثانیه‌ای، پس‌زمینه زنده، هایلایت کلمات کلیدی، اکولایزر، Whoosh SFX و پایان فالوئرگیر."""
+    """موتور وایرال ۶ سبکی: صفر درصد بریدگی متن، کنتراست بالا، Whoosh حرفه‌ای، دکمه فالو بدون خطای @ و پس‌زمینه زنده."""
     w, h, fps = 1080, 1920, 25
     work_dir = tempfile.mkdtemp(dir=TMP_ROOT)
     selected = items[:8]
@@ -2554,9 +2650,7 @@ def build_daily_summary_reel_sync(
     ed_items = (editorial or {}).get("items") or []
     outro_q = sanitize_display_headline((editorial or {}).get("outro_question", "")) or "کدوم خبر امروز مهم‌تر بود؟ شماره‌شو کامنت کن!"
 
-    # ناحیه متقارن امن ریلز:
-    # بالا: زیر y=205 | پایین: بالای y=1445 | متن راست‌چین تا x=906 (آزاد از دکمه‌های IG در x=935..1080) در حالی که کارت‌ها وسط‌چین و متقارن هستند
-    TEXT_SAFE_RIGHT = 906
+    TEXT_SAFE_RIGHT = 900
 
     gw, gh = 135, 240
     gy_grid, gx_grid = np.mgrid[0:gh, 0:gw].astype(np.float32)
@@ -2567,19 +2661,19 @@ def build_daily_summary_reel_sync(
         c1y = 0.28 + 0.14 * math.cos(t_sec * 0.50)
         c2x = 0.78 + 0.16 * math.cos(t_sec * 0.55)
         c2y = 0.76 + 0.12 * math.sin(t_sec * 0.70)
-        d1 = np.exp(-((gx_norm - c1x) ** 2 + ((gy_norm - c1y) * 1.45) ** 2) / 0.18)
-        d2 = np.exp(-((gx_norm - c2x) ** 2 + ((gy_norm - c2y) * 1.45) ** 2) / 0.22)
-        r = np.clip(14.0 + d1 * (tint_rgb[0] * 0.44) + d2 * 24.0, 0, 255)
-        g = np.clip(17.0 + d1 * (tint_rgb[1] * 0.44) + d2 * 40.0, 0, 255)
-        b = np.clip(24.0 + d1 * (tint_rgb[2] * 0.44) + d2 * 70.0, 0, 255)
+        d1 = np.exp(-((gx_norm - c1x) ** 2 + ((gy_norm - c1y) * 1.45) ** 2) / 0.19)
+        d2 = np.exp(-((gx_norm - c2x) ** 2 + ((gy_norm - c2y) * 1.45) ** 2) / 0.24)
+        r = np.clip(18.0 + d1 * (tint_rgb[0] * 0.46) + d2 * 28.0, 0, 255)
+        g = np.clip(22.0 + d1 * (tint_rgb[1] * 0.46) + d2 * 46.0, 0, 255)
+        b = np.clip(32.0 + d1 * (tint_rgb[2] * 0.46) + d2 * 78.0, 0, 255)
         return cv2.resize(np.stack([r, g, b], axis=-1).astype(np.uint8), (w, h), interpolation=cv2.INTER_LINEAR)
 
-    def make_blurred_ambient_bg(photo_path: str, tint_rgb=(20, 24, 34)) -> np.ndarray:
-        """پس‌زمینه زنده تمام‌صفحه از خود عکس خبر (برای حذف کامل فضای سیاه خالی)."""
+    def make_blurred_ambient_bg(photo_path: str, tint_rgb=(18, 24, 38)) -> np.ndarray:
+        """پس‌زمینه زنده و پرنورتر از خود عکس خبر تا نیمه پایین ویدیو هیچ حس تاریکی و خلوتی نداشته باشد."""
         if photo_path and os.path.exists(photo_path):
             sm = fit_cover(Image.open(photo_path).convert("RGB"), 270, 480)
-            arr = cv2.GaussianBlur(np.array(sm, dtype=np.uint8), (31, 31), 0)
-            tinted = cv2.addWeighted(arr, 0.42, np.full_like(arr, tint_rgb, dtype=np.uint8), 0.58, 0)
+            arr = cv2.GaussianBlur(np.array(sm, dtype=np.uint8), (27, 27), 0)
+            tinted = cv2.addWeighted(arr, 0.56, np.full_like(arr, tint_rgb, dtype=np.uint8), 0.44, 0)
             return cv2.resize(tinted, (1188, 2112), interpolation=cv2.INTER_LINEAR)
         return None
 
@@ -2602,11 +2696,11 @@ def build_daily_summary_reel_sync(
     def warp_3d_card_rgba(card_pil: Image.Image, yaw_deg: float, pitch_deg: float) -> Image.Image:
         arr = np.array(card_pil, dtype=np.uint8)
         ch, cw = arr.shape[:2]
-        pad_x, pad_y = 48, 48
+        pad_x, pad_y = 44, 44
         src = np.float32([[0, 0], [cw, 0], [cw, ch], [0, ch]])
-        dx = math.sin(math.radians(yaw_deg)) * 36.0
-        dy = math.sin(math.radians(pitch_deg)) * 22.0
-        shrink = abs(math.sin(math.radians(yaw_deg))) * 28.0
+        dx = math.sin(math.radians(yaw_deg)) * 32.0
+        dy = math.sin(math.radians(pitch_deg)) * 20.0
+        shrink = abs(math.sin(math.radians(yaw_deg))) * 24.0
         dst = np.float32([
             [pad_x + (shrink if dx > 0 else 0), pad_y + max(0.0, dy)],
             [pad_x + cw - (shrink if dx < 0 else 0), pad_y + max(0.0, -dy)],
@@ -2631,7 +2725,6 @@ def build_daily_summary_reel_sync(
             d.polygon([(trail_x - stripe_w, 0), (trail_x, 0), (trail_x - slant, h), (trail_x - stripe_w - slant, h)], fill=accent_rgba)
 
     def draw_equalizer(frame_rgba: Image.Image, x: int, y: int, energy: float, t_sec: float, bar_color=(242, 200, 68, 240)):
-        """اکولایزر صوتی زنده ۷ ستونه (در سبک ۶ هماهنگ با صدای واقعی گوینده)."""
         ed = ImageDraw.Draw(frame_rgba)
         for bi in range(7):
             phase = abs(math.sin(t_sec * (7.5 + bi * 1.4) + bi * 0.9))
@@ -2687,19 +2780,19 @@ def build_daily_summary_reel_sync(
         y0 = max(0, (ah - ch) // 2)
         return cv2.resize(arr[y0:y0 + ch, x0:x0 + cw], (target_w, target_h), interpolation=cv2.INTER_LINEAR)
 
+    # سایه نرم‌تر تا نیمه پایینی ویدیو زنده و خوش‌رنگ باقی بماند
     vignette = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     vd = ImageDraw.Draw(vignette)
-    for y in range(420):
-        vd.line([(0, y), (w, y)], fill=(10, 12, 18, int(218 * (1.0 - y / 420.0))))
-    for y in range(860, h):
-        vd.line([(0, y), (w, y)], fill=(10, 12, 18, int(246 * (((y - 860) / (h - 860)) ** 1.12))))
+    for y in range(380):
+        vd.line([(0, y), (w, y)], fill=(10, 14, 22, int(205 * (1.0 - y / 380.0))))
+    for y in range(1040, h):
+        vd.line([(0, y), (w, y)], fill=(10, 14, 22, int(200 * (((y - 1040) / (h - 1040)) ** 1.15))))
 
     now_tehran = get_tehran_now()
     jnow = jdatetime.datetime.fromgregorian(datetime=now_tehran)
     date_str = to_persian_digits(f"{JALALI_WEEKDAYS[jnow.weekday()]} {jnow.day} {JALALI_MONTHS[jnow.month]} {jnow.year}")
     clock_str = to_persian_digits(now_tehran.strftime("%H:%M"))
 
-    # عکس‌های مونتاژ رگباری Cold Open (۳ عکس اول خبرها)
     cold_photos = []
     for it in selected:
         p = it.get("photo")
@@ -2708,7 +2801,7 @@ def build_daily_summary_reel_sync(
         if len(cold_photos) >= 3:
             break
 
-    # --- مقدمه سریع و کوبنده (۱۰۰٪ متقارن در منطقه امن) ---
+    # --- مقدمه سریع و کوبنده ---
     intro_box = (64, 445, w - 64, 1055)
     intro_ov = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     idraw = ImageDraw.Draw(intro_ov)
@@ -2728,31 +2821,32 @@ def build_daily_summary_reel_sync(
     draw_centered_block_in_box(idraw, (96, 775, w - 108, 885), "مرور سریع مهم‌ترین اخبار ایران و شیراز", "bold", (242, 200, 68, 255), max_size=38, min_size=26, max_lines=1, align="center", shadow=False)
     draw_rtl_text(idraw, (w // 2, 926), BRAND_HANDLE, load_font("bold", 36), (205, 212, 224, 255), align="center", shadow=False, is_rtl=False)
 
-    # --- پایان فالوئرگیر و کامنت‌گیر (۲ حالت دکمه: قبل و بعد از کلیک فالو) ---
+    # --- پایان فالوئرگیر با اصلاح ۱۰۰٪ دکمه فالو (جدا کردن LTR و RTL تا @ هرگز جابه‌جا نشود) ---
     outro_box = (64, 410, w - 64, 1175)
     outro_base = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     od = ImageDraw.Draw(outro_base)
     od.rounded_rectangle(outro_box, radius=36, outline=accent_intro + (155,) if style == "hologram" else (255, 255, 255, 76), width=3)
     paste_logo(outro_base, od, (w - 135) // 2, 225, 155, 118)
-    # باکس سؤال کامنت‌گیر بالای کارت پایان
     od.rounded_rectangle([(104, 462), (w - 104, 628)], radius=24, fill=(242, 200, 68, 32), outline=(242, 200, 68, 190), width=3)
     draw_rtl_text(od, (w // 2, 476), "نظر شما در کامنت‌ها:", load_font("bold", 28), (242, 200, 68, 255), align="center", shadow=False)
     draw_centered_block_in_box(od, (124, 514, w - 124, 620), outro_q, "bold", (255, 255, 255, 255), max_size=36, min_size=24, max_lines=2, align="center")
     draw_rtl_text(od, (w // 2, 668), BRAND_TITLE_FA, load_font("display", 78), (255, 255, 255, 255), align="center")
     draw_centered_block_in_box(od, (96, 785, w - 96, 912), "برای پیگیری مهم‌ترین خبرهای ایران و شیراز فالو کنید", "bold", (215, 224, 238, 255), max_size=38, min_size=26, max_lines=2, align="center")
 
-    # دکمه قبل و بعد از انیمیشن کلیک فالو
-    btn_pre = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    bpd = ImageDraw.Draw(btn_pre)
-    bpd.rounded_rectangle([(205, 955), (w - 205, 1085)], radius=28, fill=(204, 18, 28, 255), outline=(255, 255, 255, 160), width=3)
-    draw_rtl_text(bpd, (w // 2, 992), f"+ فالو کنید  |  {BRAND_HANDLE}", load_font("bold", 42), (255, 255, 255, 255), align="center", shadow=False)
+    def build_follow_btn(fill_rgba: tuple, border_rgba: tuple, fa_label: str) -> Image.Image:
+        lay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        bd = ImageDraw.Draw(lay)
+        bd.rounded_rectangle([(148, 955), (w - 148, 1085)], radius=28, fill=fill_rgba, outline=border_rgba, width=4)
+        # آیدی انگلیسی سمت چپ با جهت LTR دقیق (بدون پریدن علامت @)
+        draw_rtl_text(bd, (365, 994), BRAND_HANDLE, load_font("bold", 38), (255, 255, 255, 255), align="center", shadow=False, is_rtl=False)
+        bd.line([(578, 982), (578, 1058)], fill=(255, 255, 255, 160), width=3)
+        # عبارت فارسی سمت راست با جهت RTL دقیق
+        draw_rtl_text(bd, (748, 992), fa_label, load_font("bold", 40), (255, 255, 255, 255), align="center", shadow=False, is_rtl=True)
+        return lay
 
-    btn_post = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    bsd = ImageDraw.Draw(btn_post)
-    bsd.rounded_rectangle([(205, 955), (w - 205, 1085)], radius=28, fill=(22, 163, 74, 255), outline=(255, 255, 255, 220), width=4)
-    draw_rtl_text(bsd, (w // 2, 992), f"دنبال شد ✓  |  {BRAND_HANDLE}", load_font("bold", 42), (255, 255, 255, 255), align="center", shadow=False)
+    btn_pre = build_follow_btn((204, 18, 28, 255), (255, 255, 255, 170), "فالو کنید +")
+    btn_post = build_follow_btn((22, 163, 74, 255), (255, 255, 255, 225), "دنبال شد ✓")
 
-    # زمان‌بندی دقیق (سریع و وایرال — بدون مکث مرده)
     if style == "hologram" and narration_plan and len(narration_plan.get("durs", [])) == (len(selected) + 2):
         durs_list = narration_plan["durs"]
         intro_dur, outro_dur = durs_list[0], durs_list[-1]
@@ -2772,15 +2866,13 @@ def build_daily_summary_reel_sync(
         acc += d
         cut_times.append(acc)
 
-    # مسترینگ صدای نهایی (موزیک + Whoosh SFX روی کات‌ها + داکینگ صدای گوینده فقط در سبک ۶ + انرژی اکولایزر)
     audio_path, eq_energies = build_mastered_reel_audio_sync(
         work_dir, total_sec, cut_times,
-        mode="hologram" if style == "hologram" else "news",
+        mode="hologram" if style == "hologram" else ("kinetic" if style == "kinetic" else "news"),
         voice_wav=voice_wav if style == "hologram" else "",
     )
     out_mp4 = os.path.join(TMP_ROOT, f"viral_daily_{style}_{int(time.time()*1000)}.mp4")
 
-    # آماده‌سازی داده‌های تمیز هر خبر
     clean_headlines = []
     for idx, it in enumerate(selected):
         if idx < len(ed_items):
@@ -2807,9 +2899,16 @@ def build_daily_summary_reel_sync(
         for _ in range(36):
             particles.append((prng.uniform(0, w), prng.uniform(0, h), prng.uniform(24, 70), prng.uniform(3, 7), prng.choice([(0, 232, 255), (255, 206, 54), (240, 56, 72)])))
 
-    def make_line_layers(hl_txt: str, hl_words: list, box_w: int, box_h: int, anchor_x: int, top_y: int, font_kind: str, max_sz: int, min_sz: int, max_lines: int, align: str, normal_c=(255, 255, 255, 255), hl_c=(255, 212, 48, 255), pill_bg=None, canvas_size=(w, h)):
+    def make_line_layers(
+        hl_txt: str, hl_words: list, box_w: int, box_h: int, anchor_x: int, top_y: int,
+        font_kind: str, max_sz: int, min_sz: int, max_lines: int, align: str,
+        normal_c=(255, 255, 255, 255), hl_c=(255, 255, 255, 255), pill_bg=None, canvas_size=(w, h)
+    ):
         probe = ImageDraw.Draw(Image.new("RGBA", (10, 10)))
-        f_ch, lines, lh = fit_text_in_box(probe, hl_txt, font_kind, box_w, box_h, max_size=max_sz, min_size=min_sz, max_lines=max_lines, line_spacing=1.36)
+        f_ch, lines, lh = fit_highlighted_text_in_box(
+            probe, hl_txt, font_kind, box_w, box_h, hl_words,
+            has_pill=(pill_bg is not None), max_size=max_sz, min_size=min_sz, max_lines=max_lines, line_spacing=1.38
+        )
         tot_h = len(lines) * lh
         sy = top_y + max(0, (box_h - tot_h) // 2)
         lays = []
@@ -2828,7 +2927,7 @@ def build_daily_summary_reel_sync(
         accent_c = get_accent_for_tag(tag_txt)
         t_lbl = to_persian_digits(item.get("time", ""))
         cnt_str = to_persian_digits(f"{idx:02d} / {n_news:02d}")
-        amb_bg = make_blurred_ambient_bg(photo_p, (16, 20, 32)) if has_photo else None
+        amb_bg = make_blurred_ambient_bg(photo_p, (18, 24, 38)) if has_photo else None
 
         entry = {
             "idx": idx, "tag": tag_txt, "headline": hl_txt, "hl_words": hl_words,
@@ -2839,12 +2938,10 @@ def build_daily_summary_reel_sync(
         if style == "broadcast":
             if has_photo:
                 entry["photo_arr"] = np.array(fit_cover(Image.open(photo_p).convert("RGB"), 1240, 2204), dtype=np.uint8)
-            # کارت شیشه‌ای ۱۰۰٪ متقارن (x=64..1016)، ولی متن‌ها داخل ناحیه امن (تا x=906) بدون برخورد با دکمه‌های IG
-            cb_w, cb_h = w - 128, 400
+            cb_w, cb_h = w - 128, 405
             card_chrome = Image.new("RGBA", (cb_w, cb_h), (0, 0, 0, 0))
             cd = ImageDraw.Draw(card_chrome)
             cd.rounded_rectangle([(0, 0), (cb_w - 1, cb_h - 1)], radius=32, outline=(255, 255, 255, 86), width=3)
-            # خط عمودی برند در لبه امن سمت راست متن (cb_x = 906 - 64 = 842)
             safe_r_in = TEXT_SAFE_RIGHT - 64
             cd.rounded_rectangle([(safe_r_in + 10, 30), (safe_r_in + 24, cb_h - 30)], radius=7, fill=accent_c + (255,))
             cd.polygon([(safe_r_in - 270, 24), (safe_r_in - 4, 24), (safe_r_in - 4, 78), (safe_r_in - 294, 78)], fill=accent_c + (255,))
@@ -2852,10 +2949,11 @@ def build_daily_summary_reel_sync(
             if t_lbl:
                 draw_rtl_text(cd, (36, 36), f"ساعت {t_lbl}", load_font("regular", 25), (195, 205, 220, 220), align="left", shadow=False)
 
+            # کنتراست بالا: متن سفید شفاف داخل باکس قرمز برند + حاشیه امن چپ و راست (صفر بریدگی)
             line_lays = make_line_layers(
-                hl_txt, hl_words, safe_r_in - 56, cb_h - 118, safe_r_in - 16, 92,
-                "display", 58, 30, 3, "right", (255, 255, 255, 255), (255, 212, 48, 255),
-                pill_bg=accent_c + (185,), canvas_size=(cb_w, cb_h)
+                hl_txt, hl_words, safe_r_in - 74, cb_h - 118, safe_r_in - 22, 92,
+                "display", 54, 26, 4, "right", (255, 255, 255, 255), (255, 255, 255, 255),
+                pill_bg=accent_c + (235,), canvas_size=(cb_w, cb_h)
             )
             hud_top = Image.new("RGBA", (w, 340), (0, 0, 0, 0))
             hd = ImageDraw.Draw(hud_top)
@@ -2884,9 +2982,9 @@ def build_daily_summary_reel_sync(
             sd.rectangle([(TEXT_SAFE_RIGHT + 2, 976), (TEXT_SAFE_RIGHT + 14, 1300)], fill=accent_c + (255,))
 
             line_lays = make_line_layers(
-                hl_txt, hl_words, TEXT_SAFE_RIGHT - 84, 330, TEXT_SAFE_RIGHT - 18, 970,
-                "display", 62, 32, 4, "right", (255, 255, 255, 255), (255, 212, 48, 255),
-                pill_bg=accent_c + (175,), canvas_size=(w, h)
+                hl_txt, hl_words, TEXT_SAFE_RIGHT - 100, 330, TEXT_SAFE_RIGHT - 22, 970,
+                "display", 58, 26, 4, "right", (255, 255, 255, 255), (255, 255, 255, 255),
+                pill_bg=accent_c + (235,), canvas_size=(w, h)
             )
             entry["static_split"], entry["line_lays"] = static_split, line_lays
 
@@ -2907,13 +3005,16 @@ def build_daily_summary_reel_sync(
 
             hl_lay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
             hd = ImageDraw.Draw(hl_lay)
-            f_ed, ed_lines, ed_lh = fit_text_in_box(hd, hl_txt, "display", TEXT_SAFE_RIGHT - 86, 355, max_size=62, min_size=32, max_lines=4, line_spacing=1.38)
+            f_ed, ed_lines, ed_lh = fit_highlighted_text_in_box(
+                hd, hl_txt, "display", TEXT_SAFE_RIGHT - 96, 355, hl_words,
+                has_pill=False, max_size=58, min_size=26, max_lines=4, line_spacing=1.38
+            )
             line_rects, cur_y = [], 1005
             for ln in ed_lines:
                 t_draw, kw = prepare_text_and_kwargs(ln, is_rtl=True)
                 bb = hd.textbbox((0, 0), t_draw, font=f_ed, **kw)
                 line_rects.append((max(68, TEXT_SAFE_RIGHT - (bb[2] - bb[0]) - 24), cur_y + int(ed_lh * 0.54), TEXT_SAFE_RIGHT + 4, cur_y + int(ed_lh * 0.86)))
-                draw_highlighted_rtl_line(hd, TEXT_SAFE_RIGHT - 6, cur_y, ln, f_ed, (250, 248, 242, 255), (255, 224, 92, 255), hl_words, align="right", shadow=True)
+                draw_highlighted_rtl_line(hd, TEXT_SAFE_RIGHT - 8, cur_y, ln, f_ed, (250, 248, 242, 255), (255, 224, 92, 255), hl_words, align="right", pill_bg=None, shadow=True)
                 cur_y += ed_lh
             entry["ed_frame"], entry["hl_lay"], entry["line_rects"] = ed_frame, hl_lay, line_rects
 
@@ -2928,7 +3029,7 @@ def build_daily_summary_reel_sync(
             draw_rtl_text(kd, (w // 2, 1408), BRAND_HANDLE, load_font("bold", 32), (255, 255, 255, 235), align="center", shadow=True, is_rtl=False)
 
             probe = ImageDraw.Draw(Image.new("RGBA", (w, h)))
-            fk, k_lines, k_lh = fit_text_in_box(probe, hl_txt, "display", 760, 410, max_size=68, min_size=34, max_lines=4, line_spacing=1.40)
+            fk, k_lines, k_lh = fit_highlighted_text_in_box(probe, hl_txt, "display", 740, 410, hl_words, has_pill=False, max_size=64, min_size=28, max_lines=4, line_spacing=1.40)
             start_y = 950 + (410 - len(k_lines) * k_lh) // 2
             line_layers = []
             for li, ln in enumerate(k_lines):
@@ -2937,9 +3038,9 @@ def build_daily_summary_reel_sync(
                 t_draw, kw = prepare_text_and_kwargs(ln, is_rtl=True)
                 bb = ld.textbbox((0, 0), t_draw, font=fk, **kw)
                 lw, lh_b, ly = bb[2] - bb[0], bb[3] - bb[1], start_y + li * k_lh
-                cx_k = w // 2 - 24  # متعادل در مرکز و دور از دکمه‌های راست
+                cx_k = w // 2 - 24
                 ld.rounded_rectangle([(cx_k - lw // 2 - 30, ly - 10), (cx_k + lw // 2 + 30, ly + lh_b + 24)], radius=14, fill=(accent_c + (245,)) if li == 0 else (12, 14, 18, 240))
-                draw_highlighted_rtl_line(ld, cx_k, ly, ln, fk, (255, 255, 255, 255), (255, 224, 52, 255), hl_words, align="center", shadow=False)
+                draw_highlighted_rtl_line(ld, cx_k, ly, ln, fk, (255, 255, 255, 255), (255, 224, 52, 255), hl_words, align="center", pill_bg=None, shadow=False)
                 line_layers.append(lay)
             entry["k_hud"], entry["line_layers"] = k_hud, line_layers
 
@@ -2961,40 +3062,42 @@ def build_daily_summary_reel_sync(
             ld.polygon([(w - 400, 852), (w - 64, 852), (w - 64, 916), (w - 430, 916)], fill=accent_c + (245,))
             draw_centered_block_in_box(ld, (w - 395, 856, w - 70, 912), f"{tag_txt}  |  {cnt_str}", "bold", (255, 255, 255, 255), max_size=26, min_size=20, max_lines=1)
 
-            # پلیت استودیویی متقارن (x=60..1020)، متن داخل ناحیه امن تا x=906
-            ld.rounded_rectangle([(60, 948), (w - 60, 1312)], radius=24, fill=(18, 24, 36, 238), outline=(255, 255, 255, 72), width=3)
-            ld.rectangle([(TEXT_SAFE_RIGHT + 4, 976), (TEXT_SAFE_RIGHT + 18, 1284)], fill=accent_c + (255,))
+            ld.rounded_rectangle([(60, 948), (w - 60, 1318)], radius=24, fill=(18, 24, 36, 238), outline=(255, 255, 255, 72), width=3)
+            ld.rectangle([(TEXT_SAFE_RIGHT + 4, 976), (TEXT_SAFE_RIGHT + 18, 1290)], fill=accent_c + (255,))
             line_lays = make_line_layers(
-                hl_txt, hl_words, TEXT_SAFE_RIGHT - 96, 315, TEXT_SAFE_RIGHT - 18, 972,
-                "display", 58, 30, 3, "right", (255, 255, 255, 255), (255, 212, 48, 255),
-                pill_bg=accent_c + (175,), canvas_size=(w, h)
+                hl_txt, hl_words, TEXT_SAFE_RIGHT - 110, 320, TEXT_SAFE_RIGHT - 22, 972,
+                "display", 54, 26, 4, "right", (255, 255, 255, 255), (255, 255, 255, 255),
+                pill_bg=accent_c + (235,), canvas_size=(w, h)
             )
             entry["live_ov"], entry["line_lays"] = live_ov, line_lays
 
-        else:  # style == "hologram" (سبک ۶: پس‌زمینه زنده + کارت هولوگرام سه‌بعدی متقارن با عکس متحرک + گوینده اختصاصی Gemini TTS)
+        else:  # style == "hologram" (سبک ۶: کنتراست شفاف سفید روی باکس قرمز + نشان خبر ۰۱ + حاشیه امن بدون بریدگی)
             neon_c = (0, 226, 255) if (idx % 2 == 1) else (255, 198, 42)
             entry["neon"] = neon_c
-            card_w, card_h = 840, 980
+            card_w, card_h = 850, 990
             if has_photo:
                 entry["photo_arr"] = np.array(fit_cover(Image.open(photo_p).convert("RGB"), 920, 620), dtype=np.uint8)
 
-            # لایه ثابت قاب کارت هولوگرام (عکس زنده در هر فریم داخل آن زوم می‌شود)
             holo_chrome = Image.new("RGBA", (card_w, card_h), (0, 0, 0, 0))
             hcd = ImageDraw.Draw(holo_chrome)
-            hcd.rounded_rectangle([(0, 0), (card_w - 1, card_h - 1)], radius=34, fill=(12, 18, 30, 216), outline=neon_c + (235,), width=5)
-            # سوراخ شفاف برای عکس زنده بالای کارت
-            photo_hole_mask = Image.new("L", (card_w - 44, 520), 0)
-            ImageDraw.Draw(photo_hole_mask).rounded_rectangle([(0, 0), (card_w - 45, 519)], radius=24, fill=255)
-            hcd.rounded_rectangle([(22, 22), (card_w - 22, 542)], radius=24, outline=neon_c + (185,), width=3)
+            hcd.rounded_rectangle([(0, 0), (card_w - 1, card_h - 1)], radius=34, fill=(12, 18, 30, 222), outline=neon_c + (235,), width=5)
+            photo_hole_mask = Image.new("L", (card_w - 44, 515), 0)
+            ImageDraw.Draw(photo_hole_mask).rounded_rectangle([(0, 0), (card_w - 45, 514)], radius=24, fill=255)
+            hcd.rounded_rectangle([(22, 22), (card_w - 22, 537)], radius=24, outline=neon_c + (185,), width=3)
 
-            hcd.rounded_rectangle([(card_w - 290, 564), (card_w - 30, 622)], radius=14, fill=accent_c + (250,))
-            draw_centered_block_in_box(hcd, (card_w - 284, 568, card_w - 36, 618), tag_txt, "bold", (255, 255, 255, 255), max_size=28, min_size=20, max_lines=1)
-            draw_rtl_text(hcd, (38, 570), f"خبر {to_persian_digits(str(idx))}", load_font("display", 42), neon_c + (255,), align="left", shadow=False)
+            # برچسب دسته خبر (راست) + نشان مرتب «خبر ۰۱» داخل کپسول (چپ — دیگر شبیه «خبرا» نمی‌شود)
+            hcd.rounded_rectangle([(card_w - 295, 560), (card_w - 34, 618)], radius=14, fill=accent_c + (250,))
+            draw_centered_block_in_box(hcd, (card_w - 289, 564, card_w - 40, 614), tag_txt, "bold", (255, 255, 255, 255), max_size=28, min_size=20, max_lines=1)
 
+            hcd.rounded_rectangle([(34, 560), (225, 618)], radius=14, fill=(22, 32, 52, 240), outline=neon_c + (210,), width=2)
+            num_badge = f"خبر  {to_persian_digits(f'{idx:02d}')}"
+            draw_centered_block_in_box(hcd, (42, 564, 217, 614), num_badge, "bold", neon_c + (255,), max_size=30, min_size=22, max_lines=1)
+
+            # متن داخل کارت با ۵۰ پیکسل حاشیه امن از هر طرف و کنتراست عالی (سفید روی باکس قرمز برند)
             card_line_lays = make_line_layers(
-                hl_txt, hl_words, card_w - 86, card_h - 664, card_w - 42, 642,
-                "display", 56, 30, 3, "right", (255, 255, 255, 255), neon_c + (255,),
-                pill_bg=accent_c + (170,), canvas_size=(card_w, card_h)
+                hl_txt, hl_words, card_w - 108, card_h - 662, card_w - 50, 638,
+                "display", 52, 24, 4, "right", (255, 255, 255, 255), (255, 255, 255, 255),
+                pill_bg=accent_c + (235,), canvas_size=(card_w, card_h)
             )
             holo_hud = Image.new("RGBA", (w, 330), (0, 0, 0, 0))
             hhd = ImageDraw.Draw(holo_hud)
@@ -3015,7 +3118,7 @@ def build_daily_summary_reel_sync(
         def cur_energy():
             return eq_energies[min(len(eq_energies) - 1, f_idx)]
 
-        # ۱. قلاب رگباری ۱.۵ تا ۱.۹ ثانیه‌ای (Cold Open: فلاش عکس‌های داغ + قفل روی تیتر اصلی)
+        # ۱. قلاب رگباری سریع (حدود ۲ ثانیه)
         n_intro = int(round(intro_dur * fps))
         for i in range(n_intro):
             lt = i / fps
@@ -3024,7 +3127,7 @@ def build_daily_summary_reel_sync(
                 p_sel = cold_photos[min(len(cold_photos) - 1, int(lt / 0.30))]
                 bg = zoom_pan_slice(p_sel, w, h, (lt % 0.30) / 0.30, zoom_amt=0.14, pan_dir=1)
                 bg_rgba = Image.fromarray(bg).convert("RGBA")
-                bg_rgba.alpha_composite(Image.new("RGBA", (w, h), (12, 16, 26, 138)))
+                bg_rgba.alpha_composite(Image.new("RGBA", (w, h), (12, 16, 26, 132)))
                 bg = np.array(bg_rgba.convert("RGB"), dtype=np.uint8)
             else:
                 bg = make_dark_gradient_bg(global_t, (0, 175, 235) if style == "hologram" else (204, 18, 28))
@@ -3056,7 +3159,7 @@ def build_daily_summary_reel_sync(
                     base_rgba = Image.fromarray(bg_rgb).convert("RGBA")
                     base_rgba.alpha_composite(vignette)
                     dy = int(85 * ((1.0 - min(1.0, max(0.0, (lt - 0.08) / 0.44))) ** 3))
-                    cur_box = (64, 995 + dy, w - 64, 1395 + dy)
+                    cur_box = (64, 990 + dy, w - 64, 1395 + dy)
                     frame = apply_glass_box(np.array(base_rgba.convert("RGB"), dtype=np.uint8), cur_box, radius=32, alpha=0.62)
                     frame.alpha_composite(sl["card_chrome"], (cur_box[0], cur_box[1]))
                     for li, l_lay in enumerate(sl["line_lays"]):
@@ -3097,7 +3200,7 @@ def build_daily_summary_reel_sync(
 
                 elif style == "editorial":
                     if amb_bg is not None:
-                        bg_ed = cv2.addWeighted(paper_bg_arr, 0.72, zoom_pan_slice(amb_bg, w, h, prog, 0.05, pan_d), 0.28, 0)
+                        bg_ed = cv2.addWeighted(paper_bg_arr, 0.68, zoom_pan_slice(amb_bg, w, h, prog, 0.05, pan_d), 0.32, 0)
                     else:
                         bg_ed = paper_bg_arr.copy()
                     frame = Image.fromarray(bg_ed).convert("RGBA")
@@ -3166,7 +3269,7 @@ def build_daily_summary_reel_sync(
                     elif lt > (dur - wipe_dur):
                         draw_broadcast_wipe(frame, "in", (lt - (dur - wipe_dur)) / wipe_dur)
 
-                else:  # style == "hologram" (سبک ۶: پس‌زمینه زنده + کارت ۳بعدی متقارن با عکس متحرک + اکولایزر صدای واقعی گوینده)
+                else:  # style == "hologram"
                     neon_c = sl["neon"]
                     bg_h = zoom_pan_slice(amb_bg, w, h, prog, 0.06, pan_d) if amb_bg is not None else make_dark_gradient_bg(global_t * 1.1, neon_c)
                     frame = Image.fromarray(bg_h).convert("RGBA")
@@ -3177,29 +3280,24 @@ def build_daily_summary_reel_sync(
                         px = (px0 + math.sin(global_t * 1.6 + py0 * 0.01) * 18) % w
                         fd.ellipse([(px - rad, py - rad), (px + rad, py + rad)], fill=pcol + (145,))
 
-                    # ساخت کارت زنده با عکس متحرک + ورود خط‌به‌خط تیتر با هایلایت کلمات کلیدی
                     card_frame = sl["holo_chrome"].copy()
-                    cw_in, ch_in = card_frame.width - 44, 520
-                    if photo_arr is not None:
-                        live_pic = Image.fromarray(zoom_pan_slice(photo_arr, cw_in, ch_in, prog, 0.11, pan_d))
-                    else:
-                        live_pic = Image.fromarray(make_dark_gradient_bg(global_t * 1.3, neon_c)[0:ch_in, 0:cw_in])
+                    cw_in, ch_in = card_frame.width - 44, 515
+                    live_pic = Image.fromarray(zoom_pan_slice(photo_arr, cw_in, ch_in, prog, 0.11, pan_d)) if photo_arr is not None else Image.fromarray(make_dark_gradient_bg(global_t * 1.3, neon_c)[0:ch_in, 0:cw_in])
                     card_frame.paste(live_pic, (22, 22), sl["photo_hole_mask"])
                     for li, c_lay in enumerate(sl["card_line_lays"]):
                         if lt >= (0.14 + li * 0.22):
                             card_frame.alpha_composite(c_lay)
 
-                    base_yaw = 7.5 if (s_idx % 2 == 0) else -7.5
+                    base_yaw = 6.5 if (s_idx % 2 == 0) else -6.5
                     yaw = base_yaw * math.cos(lt * 0.85)
-                    pitch = 3.2 * math.sin(lt * 1.1)
-                    float_y = int(12 * math.sin(lt * 1.8))
+                    pitch = 2.8 * math.sin(lt * 1.1)
+                    float_y = int(11 * math.sin(lt * 1.8))
                     warped = warp_3d_card_rgba(card_frame, yaw, pitch)
-                    # ۱۰۰٪ متقارن در مرکز افقی (و بالای خط کپشن اینستاگرام)
-                    frame.alpha_composite(warped, ((w - warped.width) // 2, 306 + float_y))
+                    frame.alpha_composite(warped, ((w - warped.width) // 2, 304 + float_y))
                     frame.alpha_composite(sl["holo_hud"], (0, 0))
                     draw_equalizer(frame, 498, 245, en, global_t, neon_c + (245,))
                     draw_progress_bars(frame, s_idx, prog, bar_y=202, active_c=neon_c + (255,))
-                    draw_rtl_text(ImageDraw.Draw(frame), (w // 2, 1412), "گزارش صوتی و تصویری  |  مهم‌ترین اخبار ایران و شیراز", load_font("bold", 26), (220, 230, 245, 225), align="center", shadow=False)
+                    draw_rtl_text(ImageDraw.Draw(frame), (w // 2, 1416), "گزارش صوتی و تصویری  |  مهم‌ترین اخبار ایران و شیراز", load_font("bold", 26), (225, 234, 248, 230), align="center", shadow=False)
                     if lt < wipe_dur:
                         draw_broadcast_wipe(frame, "out", lt / wipe_dur, accent_rgba=neon_c + (255,))
                     elif lt > (dur - wipe_dur):
@@ -3216,7 +3314,6 @@ def build_daily_summary_reel_sync(
             bg = make_dark_gradient_bg(global_t, (0, 175, 235) if style == "hologram" else (204, 18, 28))
             frame = apply_glass_box(bg, outro_box, radius=36, alpha=0.60)
             frame.alpha_composite(outro_base)
-            # انیمیشن تبدیل دکمه فالو به «دنبال شد ✓» همراه با حلقه کلیک در ۴۵٪ زمان پایان
             click_t = outro_dur * 0.45
             if lt < click_t:
                 frame.alpha_composite(btn_pre)
@@ -4377,7 +4474,7 @@ async def handle_message(session: aiohttp.ClientSession, msg: dict):
         if not photo_path and not clean_lines:
             await send_message(session, chat_id, "❌ عکس یا متن خبر را بفرستید.", kb_daily_collect())
             return
-        raw_hl = clean_lines[0][:95] if clean_lines else "خبر تصویری جدید"
+        raw_hl = smart_truncate_words(clean_lines[0], 98) if clean_lines else "خبر تصویری جدید"
         tag = "خبر فوری" if ("فوری" in text or "حادثه" in text) else ("ورزشی" if "ورزش" in text else "خبر شیراز")
         add_to_daily_items(raw_hl, photo_path, tag=tag)
         cnt = to_persian_digits(str(len(DAILY_ITEMS)))
