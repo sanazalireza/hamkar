@@ -1365,15 +1365,15 @@ async def _tts_via_elevenlabs(session: aiohttp.ClientSession, text: str, raw_out
 
 
 async def _tts_via_gemini_native(session: aiohttp.ClientSession, text: str, raw_wav_out: str, is_female: bool = False) -> bool:
-    """تولید کل گویندگی در یک درخواست واحد Gemini Native TTS (سریع و بدون گیر کردن در صف 429)."""
+    """موتور صوتی اختصاصی Gemini Native TTS با صبر هوشمند روی محدودیت 429 برای صدای ۱۰۰٪ یکدست و متفاوت."""
     if not GEMINI_API_KEY:
         return False
     voice_name = "Kore" if is_female else "Charon"
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key={GEMINI_API_KEY}"
     styled_prompt = (
-        "Read the following Persian TV news bulletin in a crisp, natural, energetic Iranian news anchor voice. "
-        "Pronounce every Persian word and Fars place name accurately according to diacritics (e.g. مَمَسَنی, بَیضا, خَبَر). "
-        "Leave a clear 1-second silent pause wherever there is a blank line between paragraphs:\n\n"
+        "Read this Persian TV news bulletin segment in a crisp, natural, energetic Iranian news anchor voice. "
+        "Pronounce every Persian word and Fars province place name accurately according to the diacritics "
+        "(e.g. Mamasani = مَمَسَنی, Beyza = بَیضا, khabar = خَبَر), with confident pacing and zero hesitation:\n"
         f"{text}"
     )
     body = {
@@ -1383,13 +1383,21 @@ async def _tts_via_gemini_native(session: aiohttp.ClientSession, text: str, raw_
             "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice_name}}},
         },
     }
-    backoffs = [5.0, 10.0]
+    backoffs = [12.0, 22.0, 32.0, 42.0]
     for attempt in range(len(backoffs) + 1):
         try:
-            async with session.post(url, json=body, timeout=aiohttp.ClientTimeout(total=75)) as resp:
+            async with session.post(url, json=body, timeout=aiohttp.ClientTimeout(total=60)) as resp:
                 if resp.status in (429, 503):
                     if attempt < len(backoffs):
-                        await asyncio.sleep(backoffs[attempt])
+                        wait_s = backoffs[attempt]
+                        try:
+                            err_txt = await resp.text()
+                            rm = re.search(r"retryDelay\"\s*:\s*\"(\d+(?:\.\d+)?)s", err_txt)
+                            if rm:
+                                wait_s = min(65.0, float(rm.group(1)) + 2.0)
+                        except Exception:
+                            pass
+                        await asyncio.sleep(wait_s)
                         continue
                     return False
                 if resp.status != 200:
@@ -1418,8 +1426,8 @@ async def _tts_via_gemini_native(session: aiohttp.ClientSession, text: str, raw_
                             wf.writeframes(raw_bytes)
                         return True
         except Exception:
-            if attempt < 1:
-                await asyncio.sleep(2.0)
+            if attempt < 2:
+                await asyncio.sleep(3.0)
     return False
 
 
@@ -2516,72 +2524,8 @@ def build_mastered_reel_audio_sync(
     return out_wav, energies
 
 
-def detect_narration_segment_durs(wav_path: str, scripts: list) -> list:
-    """تشخیص خودکار مکث‌های طبیعی بین خبرها در یک فایل صوتی پیوسته برای سینک دقیق هر اسلاید."""
-    n_segs = len(scripts)
-    with wave.open(wav_path, "rb") as wf:
-        sr = wf.getframerate()
-        ch = wf.getnchannels()
-        raw = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16).astype(np.float32) / 32768.0
-    mono = raw if ch == 1 else np.mean(raw.reshape(-1, ch), axis=1)
-    total_dur = len(mono) / float(sr)
-    if n_segs <= 1 or total_dur <= 1.0:
-        return [max(1.0, total_dur)]
-
-    hop = max(1, int(0.02 * sr))
-    n_win = len(mono) // hop
-    if n_win < 10:
-        return [total_dur / n_segs] * n_segs
-
-    rms = np.sqrt(np.mean(mono[:n_win * hop].reshape(n_win, hop) ** 2, axis=1))
-    rms = np.convolve(rms, np.ones(4, dtype=np.float32) / 4.0, mode="same")
-    thresh = max(0.012, float(np.percentile(rms, 20)) * 2.2)
-    is_quiet = rms < thresh
-
-    pauses = []
-    in_q, q_start = False, 0
-    for idx, q in enumerate(is_quiet):
-        if q and not in_q:
-            in_q, q_start = True, idx
-        elif not q and in_q:
-            in_q = False
-            dur_q = (idx - q_start) * 0.02
-            if dur_q >= 0.16:
-                pauses.append(((q_start + idx) * 0.01, dur_q))
-    if in_q:
-        dur_q = (len(is_quiet) - q_start) * 0.02
-        if dur_q >= 0.16:
-            pauses.append(((q_start + len(is_quiet)) * 0.01, dur_q))
-
-    weights = [max(12, len(s)) + 10 for s in scripts]
-    tot_w = float(sum(weights))
-    min_seg = min(1.4, total_dur / (n_segs * 1.6))
-
-    cuts = [0.0]
-    cum_w = 0.0
-    for k in range(1, n_segs):
-        cum_w += weights[k - 1]
-        exp_t = total_dur * (cum_w / tot_w)
-        rem_min = min_seg * (n_segs - k)
-        w_lo = max(cuts[-1] + min_seg, exp_t - max(2.4, total_dur * 0.11))
-        w_hi = min(total_dur - rem_min, exp_t + max(2.4, total_dur * 0.11))
-        if w_hi <= w_lo:
-            best_t = max(cuts[-1] + 0.5, min(total_dur - 0.5 * (n_segs - k), exp_t))
-        else:
-            cands = [(mid, dur_q) for (mid, dur_q) in pauses if w_lo <= mid <= w_hi]
-            if cands:
-                best_t = max(cands, key=lambda x: x[1] * 3.5 - abs(x[0] - exp_t) * 0.45)[0]
-            else:
-                i0 = max(0, min(len(rms) - 1, int(w_lo / 0.02)))
-                i1 = max(i0 + 1, min(len(rms), int(w_hi / 0.02)))
-                best_t = (i0 + int(np.argmin(rms[i0:i1]))) * 0.02
-        cuts.append(best_t)
-    cuts.append(total_dur)
-    return [max(0.8, cuts[i + 1] - cuts[i]) for i in range(n_segs)]
-
-
 async def prepare_hologram_narration_audio(session: aiohttp.ClientSession, items: list, editorial: dict, work_dir: str) -> dict:
-    """تولید کل گویندگی سبک ۶ در یک درخواست واحد (حدود ۱۵ ثانیه) بدون محدودیت 429 و با صدای کاملاً یکدست."""
+    """تولید گویندگی جداگانه برای هر اسلاید با سینک ۱۰۰٪ دقیق و قفل کامل روی Gemini TTS (یا ElevenLabs)."""
     ed_items = editorial.get("items") or []
     ordinals = ["خَبَرِ اوّل؛", "خَبَرِ دُوُم؛", "خَبَرِ سِوُم؛", "خَبَرِ چَهارُم؛", "خَبَرِ پَنجُم؛", "خَبَرِ شِشُم؛", "خَبَرِ هَفتُم؛", "خَبَرِ هَشتُم؛"]
 
@@ -2592,19 +2536,77 @@ async def prepare_hologram_narration_audio(session: aiohttp.ClientSession, items
         scripts.append(f"{ord_p} {sp}.")
     scripts.append("بَرایِ مُهِم‌ترین خَبَرهایِ ایران و شیراز فالو کُنید.")
 
-    # ترکیب کل متن در یک درخواست واحد با فاصله پاراگراف برای مکث طبیعی بین خبرها
-    combined_script = "\n\n".join(scripts)
+    seg_wavs = []
+    seg_durs = []
+    # قفل پیش‌فرض روی موتور اختصاصی تا در شلوغی سرور هرگز وسط کار به صدای تکراری تغییر نکند
+    preferred_engine = "ElevenLabs" if ELEVENLABS_API_KEY else ("Gemini TTS" if GEMINI_API_KEY else "")
+    locked_engine = ""
+
+    await asyncio.sleep(2.5)
+
+    for k, sc_txt in enumerate(scripts):
+        if k > 0:
+            await asyncio.sleep(3.0 if (locked_engine or preferred_engine) == "Gemini TTS" else 0.5)
+
+        w_p = os.path.join(work_dir, f"nar_{k:02d}.wav")
+        target_eng = locked_engine or preferred_engine
+        dur, eng = await synthesize_broadcast_tts(
+            session, sc_txt, w_p, work_dir,
+            already_diacritized=True, lock_engine=target_eng,
+        )
+
+        # در صورت محدودیت دقیقه‌ای Gemini TTS، صبر مجدد می‌کنیم تا همان صدای اختصاصی تولید شود
+        if dur <= 0.3 and target_eng == "Gemini TTS":
+            await asyncio.sleep(25.0)
+            dur, eng = await synthesize_broadcast_tts(
+                session, sc_txt, w_p, work_dir,
+                already_diacritized=True, lock_engine="Gemini TTS",
+            )
+
+        # فقط اگر در اولین اسلاید موتور اصلی کاملاً از دسترس خارج بود، به موتور آزاد اجازه اجرا می‌دهیم
+        if dur <= 0.3 and not locked_engine:
+            dur, eng = await synthesize_broadcast_tts(
+                session, sc_txt, w_p, work_dir,
+                already_diacritized=True, lock_engine="",
+            )
+
+        if dur > 0.3 and os.path.exists(w_p):
+            if not locked_engine:
+                locked_engine = eng
+            padded = os.path.join(work_dir, f"nar_pad_{k:02d}.wav")
+            if k == 0:
+                target_d = max(2.0, min(3.2, dur + 0.30))
+                delay_ms = 100
+            elif k == len(scripts) - 1:
+                target_d = max(2.6, dur + 0.42)
+                delay_ms = 100
+            else:
+                target_d = max(3.2, dur + 0.48)
+                delay_ms = 160
+            run_ffmpeg([
+                "ffmpeg", "-y", "-i", w_p,
+                "-af", f"adelay={delay_ms}|{delay_ms},apad=whole_dur={target_d:.2f}",
+                "-ar", "44100", "-ac", "2", padded,
+            ])
+            seg_wavs.append(padded)
+            seg_durs.append(target_d)
+        else:
+            sil = os.path.join(work_dir, f"sil_{k:02d}.wav")
+            def_d = 2.1 if k == 0 else (2.6 if k == len(scripts) - 1 else 3.8)
+            run_ffmpeg(["ffmpeg", "-y", "-f", "lavfi", "-t", f"{def_d:.2f}", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100", sil])
+            seg_wavs.append(sil)
+            seg_durs.append(def_d)
+
+    if not locked_engine:
+        return {"voice_wav": "", "durs": seg_durs, "narrated": False, "engine": ""}
+
+    list_f = os.path.join(work_dir, "nar_list.txt")
+    with open(list_f, "w") as f:
+        for sw in seg_wavs:
+            f.write(f"file '{sw}'\n")
     voice_full = os.path.join(work_dir, "voice_full.wav")
-    dur_total, eng = await synthesize_broadcast_tts(
-        session, combined_script, voice_full, work_dir, already_diacritized=True
-    )
-
-    if dur_total > 1.5 and os.path.exists(voice_full):
-        seg_durs = await asyncio.to_thread(detect_narration_segment_durs, voice_full, scripts)
-        return {"voice_wav": voice_full, "durs": seg_durs, "narrated": True, "engine": eng}
-
-    def_durs = [2.1] + [3.8 for _ in ed_items] + [2.6]
-    return {"voice_wav": "", "durs": def_durs, "narrated": False, "engine": ""}
+    run_ffmpeg(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_f, "-c", "copy", voice_full])
+    return {"voice_wav": voice_full, "durs": seg_durs, "narrated": True, "engine": locked_engine}
 
 
 def _tokenize_line_metrics(draw: ImageDraw.ImageDraw, words: list, font: ImageFont.FreeTypeFont, hw_norm: set, has_pill: bool):
