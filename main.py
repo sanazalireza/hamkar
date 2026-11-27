@@ -137,12 +137,12 @@ BURNT_HOOK_PROMPT = """تو سردبیر تیترنویسی ریلزهای خب�
 نمونه خروجی دقیق:
 {"hook_line1": "آتش‌سوزی گسترده معالی‌آباد", "hook_line2": "جزئیات مهار حریق!"}"""
 
-DIACRITIZE_PROMPT = """تو ویراستار ارشد گویندگی رادیو و خبر به زبان فارسی معیار هستی.
-متن فارسی زیر را برای خوانش بی‌نقص توسط گوینده خبری، به‌صورت کامل و دقیق «اعراب‌گذاری (حرکت‌گذاری)» کن:
-- تمام کسره‌های اضافه (ـِ)، فتحه‌ها (ـَ)، ضمه‌ها (ـُ) و تشدیدها (ـّ) را روی کلمات حساس، اسامی خاص، محله‌های شیراز، شهرهای فارس، افعال و کلمات هم‌نگاره (مثل مِلک/مُلک، کُشت/کِشت، دَور/دور، شُهر/شَهر، قَصرِ دَشت، مَعالی‌آباد) دقیقاً قرار بده.
-- هیچ کلمه‌ای را حذف، جایگزین یا تفسیر نکن؛ دقیقاً همان کلمات متن را با اعراب کامل و نقطه‌گذاری مکث طبیعی (، و .) برگردان.
-- اعداد را به حروف فارسیِ اعراب‌دار و روان تبدیل کن تا گوینده هیچ عددی را اشتباه نخواند.
-- هیچ توضیح اضافه یا علامت مارک‌داون ننویس؛ فقط متن اعراب‌گذاری‌شده را خروجی بده."""
+DIACRITIZE_PROMPT = """تو ویراستار گویندگی خبر به زبان فارسی معیار هستی.
+متن زیر را برای خوانش کاملاً روان، شمرده و طبیعی توسط گوینده خبری آماده کن:
+- اعراب‌گذاری (ـَ، ـِ، ـُ، ـّ) را «هوشمند و هدفمند» انجام بده؛ یعنی فقط روی کسره‌های اضافه، اسامی خاص، محله‌های شیراز و کلمات دوپهلو (مثل مِلک/مُلک، کُشت/کِشت، شَهر، قَصرِ دَشت) حرکت بگذار و از شلوغ کردن کل حروف با اعراب اضافه خودداری کن تا صدای گوینده دچار لکنت نشود.
+- هیچ کلمه‌ای را حذف یا عوض نکن و برای مکث طبیعی گوینده از ویرگول (،) و نقطه (.) دقیق استفاده کن.
+- اعداد را به حروف فارسی روان بنویس.
+- فقط و فقط متن نهایی آماده خوانش را بدون توضیح اضافه برگردان."""
 
 HOOK_FORBIDDEN_END_WORDS = {
     "در", "به", "از", "با", "بر", "تا", "برای", "را", "که", "و",
@@ -1144,7 +1144,7 @@ def probe_audio_duration(audio_path: str) -> float:
 
 
 async def synthesize_broadcast_tts(session: aiohttp.ClientSession, raw_text: str, out_wav: str, work_dir: str) -> float:
-    """تولید صدای گوینده فارسی اعراب‌گذاری‌شده با امضای صوتی رادیویی اختصاصی (متمایز از TTS خام)."""
+    """تولید صدای شفاف، شمرده و گرم گوینده خبری با نرخ نمونه‌برداری اصلاح‌شده (بدون تند شدن صدا)."""
     if not HAS_EDGE_TTS or edge_tts is None:
         return 0.0
 
@@ -1153,12 +1153,30 @@ async def synthesize_broadcast_tts(session: aiohttp.ClientSession, raw_text: str
 
     profile = CONFIG.get("tts_profile", "studio_baritone")
     if profile == "studio_anchor_f":
-        voice_name, rate_str, pitch_str = "fa-IR-DilaraNeural", "+4%", "-4Hz"
-        dsp_chain = "asetrate=44100*0.97,aresample=44100,atempo=1.04,highpass=f=85,equalizer=f=220:t=q:w=1.2:g=2.5,equalizer=f=3200:t=q:w=1.4:g=2.8,acompressor=threshold=-18dB:ratio=3.5:attack=10:release=120,loudnorm=I=-15:TP=-1.5:LRA=8"
+        voice_name, rate_str, pitch_str = "fa-IR-DilaraNeural", "-4%", "-2Hz"
+        # ابتدا تبدیل دقیق از 24kHz به 44.1kHz تا سرعت صدا کاملاً طبیعی بماند
+        dsp_chain = (
+            "aresample=44100,"
+            "asetrate=44100*0.985,aresample=44100,atempo=1.015,"
+            "highpass=f=85,"
+            "equalizer=f=220:t=q:w=1.2:g=2.0,"
+            "equalizer=f=3200:t=q:w=1.4:g=2.2,"
+            "acompressor=threshold=-18dB:ratio=2.8:attack=15:release=140,"
+            "loudnorm=I=-15:TP=-1.5:LRA=8"
+        )
     else:
-        # پروفایل صدای گرم و عمیق گوینده خبری اختصاصی @ShirazLastNews
-        voice_name, rate_str, pitch_str = "fa-IR-FaridNeural", "+5%", "-7Hz"
-        dsp_chain = "asetrate=44100*0.955,aresample=44100,atempo=1.055,highpass=f=75,equalizer=f=150:t=q:w=1.1:g=3.6,equalizer=f=2900:t=q:w=1.4:g=2.6,lowpass=f=11000,acompressor=threshold=-17dB:ratio=4:attack=8:release=110,loudnorm=I=-14:TP=-1.5:LRA=7"
+        # گوینده مرد خبری با سرعت شمرده (-4%) و گرمای ملایم رادیویی
+        voice_name, rate_str, pitch_str = "fa-IR-FaridNeural", "-4%", "-3Hz"
+        dsp_chain = (
+            "aresample=44100,"
+            "asetrate=44100*0.975,aresample=44100,atempo=1.026,"
+            "highpass=f=80,"
+            "equalizer=f=170:t=q:w=1.1:g=2.8,"
+            "equalizer=f=2900:t=q:w=1.4:g=2.2,"
+            "lowpass=f=11500,"
+            "acompressor=threshold=-18dB:ratio=3.0:attack=14:release=130,"
+            "loudnorm=I=-15:TP=-1.5:LRA=8"
+        )
 
     try:
         comm = edge_tts.Communicate(diac_text, voice=voice_name, rate=rate_str, pitch=pitch_str)
@@ -2121,15 +2139,15 @@ def build_map_zoom_reel_sync(wide_map: Image.Image, close_map: Image.Image, phot
 
 # ==================== ۴. موتور ۶ سبکی ریلز جمع‌بندی (بدون قلاب کاغذ سوخته) ====================
 async def prepare_hologram_narration_audio(session: aiohttp.ClientSession, items: list, work_dir: str) -> dict:
-    """تولید گویندگی اعراب‌گذاری‌شده فارسی با DSP رادیویی برای سبک ۶ + میکس هوشمند روی موزیک پس‌زمینه."""
+    """تولید گویندگی شمرده با مکث طبیعی در شروع هر اسلاید و میکس شفاف روی موزیک پس‌زمینه."""
     selected = items[:8]
     ordinals = ["یک", "دو", "سه", "چهار", "پنج", "شش", "هفت", "هشت"]
-    scripts = ["خَبَرِ فوری! مُرورِ سَریعِ اَخبارِ مُهِمِّ اِمروزِ شیراز و فارس."]
+    scripts = ["خبر فوری! مرور مهم‌ترین خبرهای امروز شیراز و استان فارس."]
     for idx, it in enumerate(selected):
         hl = strip_emojis_for_font(it.get("headline", ""))
         ord_w = ordinals[idx] if idx < len(ordinals) else str(idx + 1)
-        scripts.append(f"{ord_w}: {hl}.")
-    scripts.append("بَرایِ خَبَرهایِ لَحظه‌ای، آخَرین خَبَرهایِ شیراز را فالو کُنید.")
+        scripts.append(f"{ord_w}، {hl}.")
+    scripts.append("برای پیگیری لحظه‌ای خبرها، آخرین خبرهای شیراز را فالو کنید.")
 
     seg_wavs = []
     seg_durs = []
@@ -2140,13 +2158,18 @@ async def prepare_hologram_narration_audio(session: aiohttp.ClientSession, items
         if dur > 0.3 and os.path.exists(w_p):
             any_ok = True
             padded = os.path.join(work_dir, f"nar_pad_{k:02d}.wav")
-            target_d = max(2.2 if k in (0, len(scripts) - 1) else 3.4, dur + 0.55)
-            run_ffmpeg(["ffmpeg", "-y", "-i", w_p, "-af", f"apad=whole_dur={target_d:.2f}", "-ar", "44100", "-ac", "2", padded])
+            target_d = max(2.4 if k in (0, len(scripts) - 1) else 3.8, dur + 0.85)
+            # 0.25 ثانیه مکث در ابتدای هر خبر + فضای تنفس در انتها
+            run_ffmpeg([
+                "ffmpeg", "-y", "-i", w_p,
+                "-af", f"adelay=250|250,apad=whole_dur={target_d:.2f}",
+                "-ar", "44100", "-ac", "2", padded,
+            ])
             seg_wavs.append(padded)
             seg_durs.append(target_d)
         else:
             sil = os.path.join(work_dir, f"sil_{k:02d}.wav")
-            def_d = 2.2 if k in (0, len(scripts) - 1) else 4.2
+            def_d = 2.4 if k in (0, len(scripts) - 1) else 4.2
             run_ffmpeg(["ffmpeg", "-y", "-f", "lavfi", "-t", f"{def_d:.2f}", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100", sil])
             seg_wavs.append(sil)
             seg_durs.append(def_d)
@@ -2168,7 +2191,7 @@ async def prepare_hologram_narration_audio(session: aiohttp.ClientSession, items
         "ffmpeg", "-y",
         "-i", voice_full,
         "-stream_loop", "-1", "-i", bg_music,
-        "-filter_complex", "[0:a]volume=1.18[v];[1:a]volume=0.22[m];[v][m]amix=inputs=2:duration=first:dropout_transition=1[out]",
+        "-filter_complex", "[0:a]volume=1.85[v];[1:a]volume=0.22[m];[v][m]amix=inputs=2:duration=first:dropout_transition=1,alimiter=limit=0.95[out]",
         "-map", "[out]", "-ar", "44100", "-ac", "2", "-t", f"{total_sec:.2f}", mixed_wav,
     ])
     return {"audio_path": mixed_wav, "durs": seg_durs, "loop_audio": False, "narrated": True}
@@ -2318,10 +2341,10 @@ def build_daily_summary_reel_sync(items: list, style: str = "broadcast", narrati
     }
     idraw.polygon([(310, 566), (790, 566), (762, 636), (282, 636)], fill=(204, 18, 28, 255))
     draw_rtl_text(idraw, (536, 578), intro_tag_map.get(style, "بسته خبری روزانه"), load_font("bold", 38), (255, 255, 255, 255), align="center", shadow=False)
-    draw_rtl_text(idraw, (w // 2, 720), "۶۰ ثانیه با اخبار شیراز", load_font("display", 90), (255, 255, 255, 255), align="center")
+    draw_rtl_text(idraw, (w // 2, 720), "۶۰ ثانیه با مهم‌ترین اخبار", load_font("display", 90), (255, 255, 255, 255), align="center")
     draw_rtl_text(idraw, (w // 2, 875), date_str, load_font("bold", 40), (210, 218, 232, 255), align="center", shadow=False)
     idraw.line([(210, 965), (w - 210, 965)], fill=(255, 255, 255, 55), width=2)
-    draw_rtl_text(idraw, (w // 2, 1015), "مرور سریع برگزیده اخبار شیراز و استان فارس", load_font("bold", 36), (242, 200, 68, 255), align="center", shadow=False)
+    draw_rtl_text(idraw, (w // 2, 1015), "مرور سریع برگزیده اخبار ایران و شیراز", load_font("bold", 36), (242, 200, 68, 255), align="center", shadow=False)
     draw_rtl_text(idraw, (w // 2, 1140), BRAND_HANDLE, load_font("bold", 36), (205, 212, 224, 255), align="center", shadow=False, is_rtl=False)
 
     # پایان مشترک
