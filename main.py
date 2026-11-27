@@ -829,12 +829,29 @@ def check_shadowban_words(text: str) -> list:
 
 
 def smart_truncate_words(text: str, max_chars: int = 96) -> str:
-    """کوتاه‌سازی ایمن متن روی مرز کلمه (هرگز وسط کلمه برش نمی‌زند)."""
+    """کوتاه‌سازی ایمن روی مرز جمله یا کلمه بدون رها شدن حروف اضافه معلق (مثل با، در، از، و) در انتهای تیتر."""
     t = re.sub(r"\s+", " ", (text or "")).strip()
     if len(t) <= max_chars:
         return t
-    cut = t[:max_chars].rsplit(" ", 1)[0].strip(" ،؛:-—/")
-    return cut if len(cut) >= max_chars // 2 else t[:max_chars].strip()
+
+    # اولویت ۱: برش در پایان بخش کامل جمله (؛ یا . یا —) تا معنا کاملاً تمام‌شده بماند
+    head = t[:max_chars]
+    for sep in ("؛", ".", "—", "،"):
+        pos = head.rfind(sep)
+        if pos >= int(max_chars * 0.48):
+            cut = head[:pos].strip(" ،؛:-—/|")
+            words = cut.split()
+            while len(words) > 2 and words[-1].strip("،.؛:!؟«»") in HOOK_FORBIDDEN_END_WORDS:
+                words.pop()
+            if words:
+                return " ".join(words)
+
+    # اولویت ۲: برش روی مرز کلمه + حذف خودکار حروف اضافه معلق از انتهای جمله
+    cut = head.rsplit(" ", 1)[0].strip(" ،؛:-—/|")
+    words = cut.split()
+    while len(words) > 2 and words[-1].strip("،.؛:!؟«»") in HOOK_FORBIDDEN_END_WORDS:
+        words.pop()
+    return " ".join(words) if words else head.strip()
 
 
 def add_to_daily_items(headline: str, photo_path: str = None, tag: str = "خبر"):
@@ -848,8 +865,9 @@ def add_to_daily_items(headline: str, photo_path: str = None, tag: str = "خبر
             shutil.copy(photo_path, saved_img)
         except Exception:
             saved_img = None
+    # ذخیره متن کامل تا ۳۲۰ کاراکتر تا ویراستار کل خبر را ببیند و تیتر تمام‌شده بسازد
     DAILY_ITEMS.append({
-        "headline": smart_truncate_words(clean_hl, 108),
+        "headline": smart_truncate_words(clean_hl, 320),
         "photo": saved_img,
         "tag": strip_emojis_for_font(tag) or "شیراز",
         "time": get_tehran_now().strftime("%H:%M"),
@@ -1214,11 +1232,19 @@ def sanitize_display_headline(text: str) -> str:
 
 
 async def prepare_viral_daily_editorial(session: aiohttp.ClientSession, items: list) -> dict:
-    """آماده‌سازی یک‌جای تیترهای تمیز، کلمات کلیدی هایلایت، متن گفتاری طبیعی و سؤال کامنت‌گیر برای هر ۶ سبک."""
+    """آماده‌سازی تیترهای تمام‌شده و بی‌نقص، کلمات کلیدی هایلایت، متن گفتاری و سؤال کامنت‌گیر برای هر ۶ سبک."""
     selected = items[:8]
+
+    def finalize_complete_sentence(s: str, limit: int = 110) -> str:
+        t = smart_truncate_words(sanitize_display_headline(s), limit)
+        words = t.split()
+        while len(words) > 2 and words[-1].strip("،.؛:!؟«»") in HOOK_FORBIDDEN_END_WORDS:
+            words.pop()
+        return " ".join(words) if words else t
+
     fallback_items = []
     for it in selected:
-        hl = sanitize_display_headline(it.get("headline", "")) or BRAND_TITLE_FA
+        hl = finalize_complete_sentence(it.get("headline", ""), 88) or BRAND_TITLE_FA
         words = [w.strip("،.؛:!؟«»") for w in hl.split() if len(w.strip("،.؛:!؟«»")) >= 3]
         fallback_items.append({
             "display_headline": hl,
@@ -1233,7 +1259,13 @@ async def prepare_viral_daily_editorial(session: aiohttp.ClientSession, items: l
         return fallback
 
     numbered = "\n".join(f"{i + 1}. {sanitize_display_headline(it.get('headline', ''))}" for i, it in enumerate(selected))
-    raw = await gemini_generate(session, f"{VIRAL_DAILY_BATCH_PROMPT}\n\nخبرهای امروز:\n{numbered}")
+    extra_rules = (
+        "\nقواعد تکمیلی اجباری:\n"
+        "- اگر متن ورودی طولانی است، آن را به یک جمله کاملاً تمام‌شده، رسا و کوتاه (۷ تا ۱۱ کلمه) خلاصه کن تا هیچ‌وقت وسط جمله رها نشود.\n"
+        "- هرگز تیتر یا متن گفتاری را با حروف اضافه و ربط معلق (مثل: با، در، از، به، و، را، که، تا، برای) تمام نکن.\n"
+        "- اگر در متن ورودی غلط تایپی واضح وجود دارد (مثل «ر شیراز» به‌جای «در شیراز»)، آن را اصلاح کن."
+    )
+    raw = await gemini_generate(session, f"{VIRAL_DAILY_BATCH_PROMPT}{extra_rules}\n\nخبرهای امروز:\n{numbered}")
     if not raw:
         return fallback
 
@@ -1246,18 +1278,18 @@ async def prepare_viral_daily_editorial(session: aiohttp.ClientSession, items: l
         out_items = []
         for idx, fb in enumerate(fallback_items):
             if idx < len(p_items) and isinstance(p_items[idx], dict):
-                d_hl = sanitize_display_headline(str(p_items[idx].get("display_headline", ""))) or fb["display_headline"]
+                d_hl = finalize_complete_sentence(str(p_items[idx].get("display_headline", "")), 110) or fb["display_headline"]
                 kws = [strip_emojis_for_font(str(k)).strip("،.؛:!؟«»") for k in (p_items[idx].get("highlight_words") or []) if str(k).strip()]
-                sp = sanitize_display_headline(str(p_items[idx].get("spoken_text", ""))) or d_hl
+                sp = finalize_complete_sentence(str(p_items[idx].get("spoken_text", "")), 145) or d_hl
                 out_items.append({
-                    "display_headline": d_hl[:96],
+                    "display_headline": d_hl,
                     "highlight_words": kws[:3] if kws else fb["highlight_words"],
                     "spoken_text": apply_pronunciation_dict(sp),
                 })
             else:
                 out_items.append(fb)
-        outro_q = sanitize_display_headline(str(parsed.get("outro_question", ""))) or fallback["outro_question"]
-        return {"items": out_items, "outro_question": outro_q[:74]}
+        outro_q = finalize_complete_sentence(str(parsed.get("outro_question", "")), 78) or fallback["outro_question"]
+        return {"items": out_items, "outro_question": outro_q}
     except Exception:
         return fallback
 
@@ -4474,7 +4506,8 @@ async def handle_message(session: aiohttp.ClientSession, msg: dict):
         if not photo_path and not clean_lines:
             await send_message(session, chat_id, "❌ عکس یا متن خبر را بفرستید.", kb_daily_collect())
             return
-        raw_hl = smart_truncate_words(clean_lines[0], 98) if clean_lines else "خبر تصویری جدید"
+        joined_news = " — ".join(clean_lines[:2]) if clean_lines else "خبر تصویری جدید"
+        raw_hl = smart_truncate_words(joined_news, 300)
         tag = "خبر فوری" if ("فوری" in text or "حادثه" in text) else ("ورزشی" if "ورزش" in text else "خبر شیراز")
         add_to_daily_items(raw_hl, photo_path, tag=tag)
         cnt = to_persian_digits(str(len(DAILY_ITEMS)))
