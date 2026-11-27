@@ -854,8 +854,8 @@ def smart_truncate_words(text: str, max_chars: int = 96) -> str:
     return " ".join(words) if words else head.strip()
 
 
-def add_to_daily_items(headline: str, photo_path: str = None, tag: str = "خبر"):
-    clean_hl = strip_emojis_for_font(headline)
+def add_to_daily_items(headline: str, photo_path: str = None, tag: str = "خبر", exact_lock: bool = False) -> dict:
+    clean_hl = sanitize_display_headline(headline) if "sanitize_display_headline" in globals() else strip_emojis_for_font(headline)
     if "|" in clean_hl:
         clean_hl = clean_hl.split("|", 1)[1].strip()
     saved_img = None
@@ -865,13 +865,15 @@ def add_to_daily_items(headline: str, photo_path: str = None, tag: str = "خبر
             shutil.copy(photo_path, saved_img)
         except Exception:
             saved_img = None
-    # ذخیره متن کامل تا ۳۲۰ کاراکتر تا ویراستار کل خبر را ببیند و تیتر تمام‌شده بسازد
-    DAILY_ITEMS.append({
+    item = {
+        "id": f"{int(time.time() * 1000) % 1000000}{random.randint(10, 99)}",
         "headline": smart_truncate_words(clean_hl, 320),
         "photo": saved_img,
         "tag": strip_emojis_for_font(tag) or "شیراز",
         "time": get_tehran_now().strftime("%H:%M"),
-    })
+        "exact_lock": exact_lock,
+    }
+    DAILY_ITEMS.append(item)
     if len(DAILY_ITEMS) > 10:
         old = DAILY_ITEMS.pop(0)
         if old.get("photo") and os.path.exists(old["photo"]):
@@ -879,6 +881,37 @@ def add_to_daily_items(headline: str, photo_path: str = None, tag: str = "خبر
                 os.remove(old["photo"])
             except Exception:
                 pass
+    return item
+
+
+def kb_daily_item_inline(item_id: str, approved: bool = False) -> dict:
+    if approved:
+        return {
+            "inline_keyboard": [
+                [{"text": "✏️ ویرایش مجدد متن", "callback_data": f"di_edit:{item_id}"}, {"text": "🗑️ حذف از صف", "callback_data": f"di_del:{item_id}"}],
+            ]
+        }
+    return {
+        "inline_keyboard": [
+            [{"text": "✅ تایید همین متن", "callback_data": f"di_ok:{item_id}"}, {"text": "✏️ اصلاح متن خبر", "callback_data": f"di_edit:{item_id}"}],
+            [{"text": "🗑️ حذف این خبر از صف", "callback_data": f"di_del:{item_id}"}],
+        ]
+    }
+
+
+def format_daily_item_card(item: dict) -> str:
+    idx_num = next((i + 1 for i, it in enumerate(DAILY_ITEMS) if it.get("id") == item.get("id")), len(DAILY_ITEMS))
+    hl = item.get("headline", "")
+    char_cnt = len(hl)
+    word_cnt = len(hl.split())
+    status_line = "✅ وضعیت: تایید و قفل‌شده (عیناً نمایش و خوانده می‌شود)" if item.get("exact_lock") else "⏳ وضعیت: در انتظار تایید یا اصلاح شما"
+    len_hint = "✅ طول متن عالی برای کادر" if char_cnt <= 95 else "⚠️ متن کمی طولانی است؛ پیشنهاد می‌شود کوتاه‌ترش کنید"
+    return (
+        f"📌 خبر شماره {to_persian_digits(str(idx_num))} در صف جمع‌بندی\n"
+        f"{status_line}\n\n"
+        f"📝 متن فعلی:\n«{hl}»\n\n"
+        f"🔢 {to_persian_digits(str(char_cnt))} کاراکتر ({to_persian_digits(str(word_cnt))} کلمه) — {len_hint}"
+    )
 
 
 # ==================== اسکنر خودکار باکس‌های قاب ریلز (reel_frame.png) ====================
@@ -1232,10 +1265,10 @@ def sanitize_display_headline(text: str) -> str:
 
 
 async def prepare_viral_daily_editorial(session: aiohttp.ClientSession, items: list) -> dict:
-    """آماده‌سازی تیترهای تمام‌شده و بی‌نقص، کلمات کلیدی هایلایت، متن گفتاری و سؤال کامنت‌گیر برای هر ۶ سبک."""
+    """آماده‌سازی تیترها و کلمات کلیدی؛ برای خبرهای تایید/اصلاح‌شده دقیقاً همان متن کاربر بدون تغییر حفظ می‌شود."""
     selected = items[:8]
 
-    def finalize_complete_sentence(s: str, limit: int = 110) -> str:
+    def finalize_complete_sentence(s: str, limit: int = 120) -> str:
         t = smart_truncate_words(sanitize_display_headline(s), limit)
         words = t.split()
         while len(words) > 2 and words[-1].strip("،.؛:!؟«»") in HOOK_FORBIDDEN_END_WORDS:
@@ -1244,12 +1277,13 @@ async def prepare_viral_daily_editorial(session: aiohttp.ClientSession, items: l
 
     fallback_items = []
     for it in selected:
-        hl = finalize_complete_sentence(it.get("headline", ""), 88) or BRAND_TITLE_FA
+        raw_hl = sanitize_display_headline(it.get("headline", "")) or BRAND_TITLE_FA
+        hl = raw_hl if it.get("exact_lock") else (finalize_complete_sentence(raw_hl, 95) or BRAND_TITLE_FA)
         words = [w.strip("،.؛:!؟«»") for w in hl.split() if len(w.strip("،.؛:!؟«»")) >= 3]
         fallback_items.append({
             "display_headline": hl,
             "highlight_words": words[:2],
-            "spoken_text": hl,
+            "spoken_text": apply_pronunciation_dict(hl),
         })
     fallback = {
         "items": fallback_items,
@@ -1258,12 +1292,17 @@ async def prepare_viral_daily_editorial(session: aiohttp.ClientSession, items: l
     if not GEMINI_API_KEY or not selected:
         return fallback
 
-    numbered = "\n".join(f"{i + 1}. {sanitize_display_headline(it.get('headline', ''))}" for i, it in enumerate(selected))
+    numbered_lines = []
+    for i, it in enumerate(selected):
+        txt = sanitize_display_headline(it.get("headline", ""))
+        lock_tag = " [متن تاییدشده و قفل کاربر - بدون تغییر کلمات]" if it.get("exact_lock") else ""
+        numbered_lines.append(f"{i + 1}. {txt}{lock_tag}")
+    numbered = "\n".join(numbered_lines)
+
     extra_rules = (
         "\nقواعد تکمیلی اجباری:\n"
-        "- اگر متن ورودی طولانی است، آن را به یک جمله کاملاً تمام‌شده، رسا و کوتاه (۷ تا ۱۱ کلمه) خلاصه کن تا هیچ‌وقت وسط جمله رها نشود.\n"
-        "- هرگز تیتر یا متن گفتاری را با حروف اضافه و ربط معلق (مثل: با، در، از، به، و، را، که، تا، برای) تمام نکن.\n"
-        "- اگر در متن ورودی غلط تایپی واضح وجود دارد (مثل «ر شیراز» به‌جای «در شیراز»)، آن را اصلاح کن."
+        "- برای هر خبری که برچسب [متن تاییدشده و قفل کاربر] دارد، display_headline باید ۱۰۰٪ عیناً همان متن باشد و در spoken_text فقط روی همان کلمات اعراب‌گذاری دقیق انجام بده و هیچ کلمه‌ای کم یا زیاد نکن.\n"
+        "- برای سایر خبرها اگر متن طولانی است، آن را به یک جمله کاملاً تمام‌شده (۷ تا ۱۲ کلمه) خلاصه کن و هرگز با حرف اضافه معلق (با، در، از، به، و، را، که) تمام نکن."
     )
     raw = await gemini_generate(session, f"{VIRAL_DAILY_BATCH_PROMPT}{extra_rules}\n\nخبرهای امروز:\n{numbered}")
     if not raw:
@@ -1277,14 +1316,22 @@ async def prepare_viral_daily_editorial(session: aiohttp.ClientSession, items: l
         p_items = parsed.get("items") or []
         out_items = []
         for idx, fb in enumerate(fallback_items):
+            is_locked = bool(selected[idx].get("exact_lock"))
             if idx < len(p_items) and isinstance(p_items[idx], dict):
-                d_hl = finalize_complete_sentence(str(p_items[idx].get("display_headline", "")), 110) or fb["display_headline"]
                 kws = [strip_emojis_for_font(str(k)).strip("،.؛:!؟«»") for k in (p_items[idx].get("highlight_words") or []) if str(k).strip()]
-                sp = finalize_complete_sentence(str(p_items[idx].get("spoken_text", "")), 145) or d_hl
+                if is_locked:
+                    # قفل قطعی روی متن تاییدشده کاربر (هم در تصویر و هم در گفتار)
+                    d_hl = fb["display_headline"]
+                    sp_cand = sanitize_display_headline(str(p_items[idx].get("spoken_text", "")))
+                    # فقط در صورتی spoken_text هوش مصنوعی پذیرفته می‌شود که طولش هم‌اندازه متن کاربر باشد (صرفاً اعراب‌گذاری کرده باشد)
+                    sp = apply_pronunciation_dict(sp_cand) if (sp_cand and abs(len(sp_cand.split()) - len(d_hl.split())) <= 1) else fb["spoken_text"]
+                else:
+                    d_hl = finalize_complete_sentence(str(p_items[idx].get("display_headline", "")), 115) or fb["display_headline"]
+                    sp = apply_pronunciation_dict(finalize_complete_sentence(str(p_items[idx].get("spoken_text", "")), 150) or d_hl)
                 out_items.append({
                     "display_headline": d_hl,
                     "highlight_words": kws[:3] if kws else fb["highlight_words"],
-                    "spoken_text": apply_pronunciation_dict(sp),
+                    "spoken_text": sp,
                 })
             else:
                 out_items.append(fb)
@@ -1318,15 +1365,15 @@ async def _tts_via_elevenlabs(session: aiohttp.ClientSession, text: str, raw_out
 
 
 async def _tts_via_gemini_native(session: aiohttp.ClientSession, text: str, raw_wav_out: str, is_female: bool = False) -> bool:
-    """موتور صوتی اختصاصی Gemini Native TTS با مدیریت هوشمند صف و محدودیت 429 برای صدای ۱۰۰٪ یکدست."""
+    """تولید کل گویندگی در یک درخواست واحد Gemini Native TTS (سریع و بدون گیر کردن در صف 429)."""
     if not GEMINI_API_KEY:
         return False
     voice_name = "Kore" if is_female else "Charon"
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key={GEMINI_API_KEY}"
     styled_prompt = (
-        "Read this Persian TV news bulletin in a crisp, natural, energetic Iranian news anchor voice. "
-        "Pronounce every Persian word and Fars province place name accurately according to the diacritics "
-        "(e.g. Mamasani = مَمَسَنی, Beyza = بَیضا, khabar = خَبَر), with confident pacing and zero hesitation:\n"
+        "Read the following Persian TV news bulletin in a crisp, natural, energetic Iranian news anchor voice. "
+        "Pronounce every Persian word and Fars place name accurately according to diacritics (e.g. مَمَسَنی, بَیضا, خَبَر). "
+        "Leave a clear 1-second silent pause wherever there is a blank line between paragraphs:\n\n"
         f"{text}"
     )
     body = {
@@ -1336,21 +1383,13 @@ async def _tts_via_gemini_native(session: aiohttp.ClientSession, text: str, raw_
             "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice_name}}},
         },
     }
-    backoffs = [8.0, 16.0, 26.0, 35.0]
+    backoffs = [5.0, 10.0]
     for attempt in range(len(backoffs) + 1):
         try:
-            async with session.post(url, json=body, timeout=aiohttp.ClientTimeout(total=50)) as resp:
+            async with session.post(url, json=body, timeout=aiohttp.ClientTimeout(total=75)) as resp:
                 if resp.status in (429, 503):
                     if attempt < len(backoffs):
-                        wait_s = backoffs[attempt]
-                        try:
-                            err_txt = await resp.text()
-                            rm = re.search(r"retryDelay\"\s*:\s*\"(\d+(?:\.\d+)?)s", err_txt)
-                            if rm:
-                                wait_s = min(45.0, float(rm.group(1)) + 1.5)
-                        except Exception:
-                            pass
-                        await asyncio.sleep(wait_s)
+                        await asyncio.sleep(backoffs[attempt])
                         continue
                     return False
                 if resp.status != 200:
@@ -1379,8 +1418,8 @@ async def _tts_via_gemini_native(session: aiohttp.ClientSession, text: str, raw_
                             wf.writeframes(raw_bytes)
                         return True
         except Exception:
-            if attempt < 2:
-                await asyncio.sleep(2.5)
+            if attempt < 1:
+                await asyncio.sleep(2.0)
     return False
 
 
@@ -2477,12 +2516,75 @@ def build_mastered_reel_audio_sync(
     return out_wav, energies
 
 
+def detect_narration_segment_durs(wav_path: str, scripts: list) -> list:
+    """تشخیص خودکار مکث‌های طبیعی بین خبرها در یک فایل صوتی پیوسته برای سینک دقیق هر اسلاید."""
+    n_segs = len(scripts)
+    with wave.open(wav_path, "rb") as wf:
+        sr = wf.getframerate()
+        ch = wf.getnchannels()
+        raw = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16).astype(np.float32) / 32768.0
+    mono = raw if ch == 1 else np.mean(raw.reshape(-1, ch), axis=1)
+    total_dur = len(mono) / float(sr)
+    if n_segs <= 1 or total_dur <= 1.0:
+        return [max(1.0, total_dur)]
+
+    hop = max(1, int(0.02 * sr))
+    n_win = len(mono) // hop
+    if n_win < 10:
+        return [total_dur / n_segs] * n_segs
+
+    rms = np.sqrt(np.mean(mono[:n_win * hop].reshape(n_win, hop) ** 2, axis=1))
+    rms = np.convolve(rms, np.ones(4, dtype=np.float32) / 4.0, mode="same")
+    thresh = max(0.012, float(np.percentile(rms, 20)) * 2.2)
+    is_quiet = rms < thresh
+
+    pauses = []
+    in_q, q_start = False, 0
+    for idx, q in enumerate(is_quiet):
+        if q and not in_q:
+            in_q, q_start = True, idx
+        elif not q and in_q:
+            in_q = False
+            dur_q = (idx - q_start) * 0.02
+            if dur_q >= 0.16:
+                pauses.append(((q_start + idx) * 0.01, dur_q))
+    if in_q:
+        dur_q = (len(is_quiet) - q_start) * 0.02
+        if dur_q >= 0.16:
+            pauses.append(((q_start + len(is_quiet)) * 0.01, dur_q))
+
+    weights = [max(12, len(s)) + 10 for s in scripts]
+    tot_w = float(sum(weights))
+    min_seg = min(1.4, total_dur / (n_segs * 1.6))
+
+    cuts = [0.0]
+    cum_w = 0.0
+    for k in range(1, n_segs):
+        cum_w += weights[k - 1]
+        exp_t = total_dur * (cum_w / tot_w)
+        rem_min = min_seg * (n_segs - k)
+        w_lo = max(cuts[-1] + min_seg, exp_t - max(2.4, total_dur * 0.11))
+        w_hi = min(total_dur - rem_min, exp_t + max(2.4, total_dur * 0.11))
+        if w_hi <= w_lo:
+            best_t = max(cuts[-1] + 0.5, min(total_dur - 0.5 * (n_segs - k), exp_t))
+        else:
+            cands = [(mid, dur_q) for (mid, dur_q) in pauses if w_lo <= mid <= w_hi]
+            if cands:
+                best_t = max(cands, key=lambda x: x[1] * 3.5 - abs(x[0] - exp_t) * 0.45)[0]
+            else:
+                i0 = max(0, min(len(rms) - 1, int(w_lo / 0.02)))
+                i1 = max(i0 + 1, min(len(rms), int(w_hi / 0.02)))
+                best_t = (i0 + int(np.argmin(rms[i0:i1]))) * 0.02
+        cuts.append(best_t)
+    cuts.append(total_dur)
+    return [max(0.8, cuts[i + 1] - cuts[i]) for i in range(n_segs)]
+
+
 async def prepare_hologram_narration_audio(session: aiohttp.ClientSession, items: list, editorial: dict, work_dir: str) -> dict:
-    """تولید گویندگی ۱۰۰٪ یکدست فارسی (فقط سبک ۶) با مقدمه سریع ۲ ثانیه‌ای و قفل کامل روی یک موتور صوتی."""
+    """تولید کل گویندگی سبک ۶ در یک درخواست واحد (حدود ۱۵ ثانیه) بدون محدودیت 429 و با صدای کاملاً یکدست."""
     ed_items = editorial.get("items") or []
     ordinals = ["خَبَرِ اوّل؛", "خَبَرِ دُوُم؛", "خَبَرِ سِوُم؛", "خَبَرِ چَهارُم؛", "خَبَرِ پَنجُم؛", "خَبَرِ شِشُم؛", "خَبَرِ هَفتُم؛", "خَبَرِ هَشتُم؛"]
 
-    # جمله مقدمه کوتاه و کوبنده تا اسلاید اول سریع (حدود ۲ تا ۲.۵ ثانیه) جمع شود
     scripts = ["شَصت ثانیِه با مُهِم‌ترین اَخبار!"]
     for idx, ed in enumerate(ed_items):
         ord_p = ordinals[idx] if idx < len(ordinals) else f"خَبَرِ {idx + 1}؛"
@@ -2490,65 +2592,19 @@ async def prepare_hologram_narration_audio(session: aiohttp.ClientSession, items
         scripts.append(f"{ord_p} {sp}.")
     scripts.append("بَرایِ مُهِم‌ترین خَبَرهایِ ایران و شیراز فالو کُنید.")
 
-    seg_wavs = []
-    seg_durs = []
-    locked_engine = ""
-
-    # مکث کوتاه اولیه بعد از مرحله ویراستاری تا محدودیت لحظه‌ای Gemini فعال نشود
-    await asyncio.sleep(2.0)
-
-    for k, sc_txt in enumerate(scripts):
-        if k > 0:
-            await asyncio.sleep(2.2 if locked_engine == "Gemini TTS" else 0.4)
-        w_p = os.path.join(work_dir, f"nar_{k:02d}.wav")
-        dur, eng = await synthesize_broadcast_tts(
-            session, sc_txt, w_p, work_dir,
-            already_diacritized=True, lock_engine=locked_engine,
-        )
-        # اگر موتور قفل شده بود و موقتاً خطا داد، یک بار دیگر بعد از ۱۸ ثانیه تلاش می‌کنیم تا صدا دوگانه نشود
-        if dur <= 0.3 and locked_engine == "Gemini TTS":
-            await asyncio.sleep(18.0)
-            dur, eng = await synthesize_broadcast_tts(
-                session, sc_txt, w_p, work_dir,
-                already_diacritized=True, lock_engine="Gemini TTS",
-            )
-        if dur > 0.3 and os.path.exists(w_p):
-            if not locked_engine:
-                locked_engine = eng
-            padded = os.path.join(work_dir, f"nar_pad_{k:02d}.wav")
-            if k == 0:
-                target_d = max(2.0, min(3.1, dur + 0.30))
-                delay_ms = 100
-            elif k == len(scripts) - 1:
-                target_d = max(2.6, dur + 0.40)
-                delay_ms = 100
-            else:
-                target_d = max(3.2, dur + 0.48)
-                delay_ms = 160
-            run_ffmpeg([
-                "ffmpeg", "-y", "-i", w_p,
-                "-af", f"adelay={delay_ms}|{delay_ms},apad=whole_dur={target_d:.2f}",
-                "-ar", "44100", "-ac", "2", padded,
-            ])
-            seg_wavs.append(padded)
-            seg_durs.append(target_d)
-        else:
-            sil = os.path.join(work_dir, f"sil_{k:02d}.wav")
-            def_d = 2.1 if k == 0 else (2.6 if k == len(scripts) - 1 else 3.8)
-            run_ffmpeg(["ffmpeg", "-y", "-f", "lavfi", "-t", f"{def_d:.2f}", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100", sil])
-            seg_wavs.append(sil)
-            seg_durs.append(def_d)
-
-    if not locked_engine:
-        return {"voice_wav": "", "durs": seg_durs, "narrated": False, "engine": ""}
-
-    list_f = os.path.join(work_dir, "nar_list.txt")
-    with open(list_f, "w") as f:
-        for sw in seg_wavs:
-            f.write(f"file '{sw}'\n")
+    # ترکیب کل متن در یک درخواست واحد با فاصله پاراگراف برای مکث طبیعی بین خبرها
+    combined_script = "\n\n".join(scripts)
     voice_full = os.path.join(work_dir, "voice_full.wav")
-    run_ffmpeg(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_f, "-c", "copy", voice_full])
-    return {"voice_wav": voice_full, "durs": seg_durs, "narrated": True, "engine": locked_engine}
+    dur_total, eng = await synthesize_broadcast_tts(
+        session, combined_script, voice_full, work_dir, already_diacritized=True
+    )
+
+    if dur_total > 1.5 and os.path.exists(voice_full):
+        seg_durs = await asyncio.to_thread(detect_narration_segment_durs, voice_full, scripts)
+        return {"voice_wav": voice_full, "durs": seg_durs, "narrated": True, "engine": eng}
+
+    def_durs = [2.1] + [3.8 for _ in ed_items] + [2.6]
+    return {"voice_wav": "", "durs": def_durs, "narrated": False, "engine": ""}
 
 
 def _tokenize_line_metrics(draw: ImageDraw.ImageDraw, words: list, font: ImageFont.FreeTypeFont, hw_norm: set, has_pill: bool):
@@ -4499,7 +4555,7 @@ async def handle_message(session: aiohttp.ClientSession, msg: dict):
         add_to_daily_items(hl, photo_path, tag=badge)
         return
 
-    # --- دریافت دسته‌ای خبرهای صف جمع‌بندی ۶ سبکی ---
+    # --- دریافت دسته‌ای خبرهای صف جمع‌بندی با دکمه شیشه‌ای تایید/اصلاح زیر هر خبر ---
     if mode == "daily_collect":
         photo_path = await download_tg_file(session, msg["photo"][-1]["file_id"], ".jpg") if msg.get("photo") else ""
         clean_lines = [strip_emojis_for_font(ln) for ln in text.splitlines() if strip_emojis_for_font(ln)]
@@ -4507,16 +4563,37 @@ async def handle_message(session: aiohttp.ClientSession, msg: dict):
             await send_message(session, chat_id, "❌ عکس یا متن خبر را بفرستید.", kb_daily_collect())
             return
         joined_news = " — ".join(clean_lines[:2]) if clean_lines else "خبر تصویری جدید"
-        raw_hl = smart_truncate_words(joined_news, 300)
+        raw_hl = sanitize_display_headline(joined_news)
         tag = "خبر فوری" if ("فوری" in text or "حادثه" in text) else ("ورزشی" if "ورزش" in text else "خبر شیراز")
-        add_to_daily_items(raw_hl, photo_path, tag=tag)
-        cnt = to_persian_digits(str(len(DAILY_ITEMS)))
+        item = add_to_daily_items(raw_hl, photo_path, tag=tag, exact_lock=False)
         await send_message(
             session,
             chat_id,
-            f"✅ خبر شماره {cnt} در صف جمع‌بندی ثبت شد:\n«{raw_hl}»\n\n"
-            "خبر بعدی را بفرستید یا یکی از ۶ سبک زیر را برای ساخت ریلز انتخاب کنید.",
-            kb_daily_collect(),
+            format_daily_item_card(item),
+            kb_daily_item_inline(item["id"], approved=False),
+        )
+        return
+
+    # --- دریافت متن اصلاح‌شده کاربر پس از کلیک روی دکمه شیشه‌ای «✏️ اصلاح متن خبر» ---
+    if mode == "daily_edit_item":
+        item_id = state.get("item_id")
+        target = next((it for it in DAILY_ITEMS if it.get("id") == item_id), None)
+        if not target:
+            USER_STATE[chat_id] = {"mode": "daily_collect"}
+            await send_message(session, chat_id, "⚠️ این خبر دیگر در صف وجود ندارد.", kb_daily_collect())
+            return
+        if not text:
+            await send_message(session, chat_id, "❌ لطفاً متن اصلاح‌شده خبر را به‌صورت متنی ارسال کنید:")
+            return
+        new_hl = sanitize_display_headline(text)
+        target["headline"] = new_hl
+        target["exact_lock"] = True
+        USER_STATE[chat_id] = {"mode": "daily_collect"}
+        await send_message(
+            session,
+            chat_id,
+            format_daily_item_card(target),
+            kb_daily_item_inline(target["id"], approved=True),
         )
         return
 
@@ -4664,6 +4741,80 @@ async def handle_message(session: aiohttp.ClientSession, msg: dict):
             await send_message(session, chat_id, "\n".join(lines), kb_shadowban_actions())
         return
 
+async def handle_callback_query(session: aiohttp.ClientSession, cq: dict):
+    cq_id = cq.get("id", "")
+    from_id = str(cq.get("from", {}).get("id", ""))
+    msg = cq.get("message") or {}
+    chat_id = str(msg.get("chat", {}).get("id", ""))
+    msg_id = msg.get("message_id")
+    data = cq.get("data", "")
+
+    if not is_admin(from_id):
+        await tg_api(session, "answerCallbackQuery", {"callback_query_id": cq_id})
+        return
+
+    if data.startswith("di_ok:"):
+        item_id = data.split(":", 1)[1]
+        target = next((it for it in DAILY_ITEMS if it.get("id") == item_id), None)
+        if not target:
+            await tg_api(session, "answerCallbackQuery", {"callback_query_id": cq_id, "text": "این خبر در صف یافت نشد."})
+            return
+        target["exact_lock"] = True
+        await tg_api(session, "answerCallbackQuery", {"callback_query_id": cq_id, "text": "✅ متن خبر تایید و قفل شد."})
+        await tg_api(session, "editMessageText", {
+            "chat_id": chat_id,
+            "message_id": msg_id,
+            "text": format_daily_item_card(target),
+            "reply_markup": kb_daily_item_inline(item_id, approved=True),
+        })
+        return
+
+    if data.startswith("di_edit:"):
+        item_id = data.split(":", 1)[1]
+        target = next((it for it in DAILY_ITEMS if it.get("id") == item_id), None)
+        if not target:
+            await tg_api(session, "answerCallbackQuery", {"callback_query_id": cq_id, "text": "این خبر در صف یافت نشد."})
+            return
+        USER_STATE[chat_id] = {"mode": "daily_edit_item", "item_id": item_id}
+        await tg_api(session, "answerCallbackQuery", {"callback_query_id": cq_id, "text": "✏️ متن جدید خبر را بفرستید"})
+        await send_message(
+            session,
+            chat_id,
+            f"✏️ متن دقیق و نهایی این خبر را (با تعداد کاراکتر دلخواه خودتان) بفرستید تا جایگزین و قفل شود:\n\n"
+            f"متن فعلی برای کپی سریع:\n{target['headline']}",
+            {"inline_keyboard": [[{"text": "❌ انصراف از اصلاح", "callback_data": f"di_cancel:{item_id}"}]]},
+        )
+        return
+
+    if data.startswith("di_cancel:"):
+        USER_STATE[chat_id] = {"mode": "daily_collect"}
+        await tg_api(session, "answerCallbackQuery", {"callback_query_id": cq_id, "text": "اصلاح لغو شد."})
+        await tg_api(session, "editMessageText", {
+            "chat_id": chat_id,
+            "message_id": msg_id,
+            "text": "❌ اصلاح لغو شد؛ می‌توانید خبر بعدی را بفرستید یا یکی از ۶ سبک را انتخاب کنید.",
+        })
+        return
+
+    if data.startswith("di_del:"):
+        item_id = data.split(":", 1)[1]
+        target = next((it for it in DAILY_ITEMS if it.get("id") == item_id), None)
+        if target:
+            if target.get("photo") and os.path.exists(target["photo"]):
+                try:
+                    os.remove(target["photo"])
+                except Exception:
+                    pass
+            DAILY_ITEMS.remove(target)
+        if USER_STATE.get(chat_id, {}).get("item_id") == item_id:
+            USER_STATE[chat_id] = {"mode": "daily_collect"}
+        await tg_api(session, "answerCallbackQuery", {"callback_query_id": cq_id, "text": "🗑️ خبر از صف حذف شد."})
+        await tg_api(session, "editMessageText", {
+            "chat_id": chat_id,
+            "message_id": msg_id,
+            "text": f"🗑️ این خبر از صف جمع‌بندی حذف شد. (تعداد باقی‌مانده: {to_persian_digits(str(len(DAILY_ITEMS)))} خبر)",
+        })
+        return
 
 # ==================== حلقه اصلی ربات ====================
 async def main():
@@ -4699,7 +4850,7 @@ async def main():
                     await send_photo_file(session, ADMIN_ID, c_path, caption=c_cap, reply_markup=kb_main_menu())
 
                 url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
-                params = {"offset": offset, "timeout": 25, "allowed_updates": '["message"]'}
+                params = {"offset": offset, "timeout": 25, "allowed_updates": '["message","callback_query"]'}
                 async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=35)) as resp:
                     if resp.status == 409:
                         await asyncio.sleep(3)
@@ -4710,6 +4861,8 @@ async def main():
                             offset = update["update_id"] + 1
                             if "message" in update:
                                 await handle_message(session, update["message"])
+                            elif "callback_query" in update:
+                                await handle_callback_query(session, update["callback_query"])
             except Exception as e:
                 print(f"Loop error: {e}")
                 await asyncio.sleep(4)
