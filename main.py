@@ -183,6 +183,17 @@ VIRAL_DAILY_BATCH_PROMPT = """تو سردبیر ارشد و کارگردان ر�
 - در highlight_words دقیقاً ۲ تا ۳ کلمه مهم از داخل خودِ display_headline انتخاب کن که دقیقاً با همان املا در display_headline وجود داشته باشند.
 - در spoken_text شماره خبر ننویس (شماره خبر به‌صورت خودکار اضافه می‌شود)، اما جمله را طوری بنویس که گوینده بسیار طبیعی، روان و پرانرژی آن را بخواند."""
 
+LATIN_TO_PERSIAN_TTS = {
+    "QR": "کیو آر",
+    "SMS": "اس‌ام‌اس",
+    "VIP": "وی‌آی‌پی",
+    "ATM": "عابربانک",
+    "GPS": "جی‌پی‌اس",
+    "AI": "هوش مصنوعی",
+    "USA": "آمریکا",
+    "COVID": "کووید",
+}
+
 DEFAULT_PRONUNCIATION_DICT = {
     "خبر فوری": "خَبَرِ فوری",
     "آخرین خبرهای": "آخَرین خَبَرهایِ",
@@ -190,9 +201,20 @@ DEFAULT_PRONUNCIATION_DICT = {
     "خبر": "خَبَر",
     "مهم‌ترین": "مُهِم‌ترین",
     "مهمترین": "مُهِم‌ترین",
+    "شهدای": "شُهَدایِ",
+    "شهدا": "شُهَدا",
+    "شهید": "شَهید",
+    "قبور": "قُبورِ",
+    "غیرمجاز": "غِیرِمُجاز",
+    "عملکرد": "عَمَلکَردِ",
+    "ضرب": "ضَربِ",
+    "اقتدار": "اِقتِدارِ",
     "بیضا": "بَیضا",
     "بیضای": "بَیضایِ",
     "شهرستان بیضا": "شَهرِستانِ بَیضا",
+    "ممسنی": "مَمَسَنی",
+    "شهرستان ممسنی": "شَهرِستانِ مَمَسَنی",
+    "نورآباد ممسنی": "نورآبادِ مَمَسَنی",
     "معالی‌آباد": "مَعالی‌آباد",
     "معالی آباد": "مَعالی‌آباد",
     "قصردشت": "قَصرِ دَشت",
@@ -211,9 +233,6 @@ DEFAULT_PRONUNCIATION_DICT = {
     "لارستان": "لارِستان",
     "لامرد": "لامِرد",
     "سپیدان": "سِپیدان",
-    "ممسنی": "مَمَسَنی",
-    "شهرستان ممسنی": "شَهرِستانِ مَمَسَنی",
-    "نورآباد ممسنی": "نورآبادِ مَمَسَنی",
     "اقلید": "اِقلید",
     "آباده": "آبادِه",
     "استهبان": "اِستَهبان",
@@ -1264,9 +1283,35 @@ def sanitize_display_headline(text: str) -> str:
     return t
 
 
+def normalize_text_for_persian_tts(text: str) -> str:
+    """تبدیل اختصارات انگلیسی (مثل QR به کیو آر) و اعمال دقیق دیکشنری تلفظ فارسی بدون تغییر متن روی تصویر."""
+    out = text or ""
+    out = out.replace("%", " درصد").replace("٪", " درصد")
+    for lat, fa_pron in LATIN_TO_PERSIAN_TTS.items():
+        out = re.sub(rf"(?<![A-Za-z]){re.escape(lat)}(?![A-Za-z])", fa_pron, out, flags=re.IGNORECASE)
+    out = apply_pronunciation_dict(out)
+    return re.sub(r"\s+", " ", out).strip()
+
+
+def get_gemini_tts_keys() -> list:
+    """پشتیبانی از یک یا چند کلید Gemini (کلید اصلی + GEMINI_API_KEY_2 و GEMINI_API_KEY_3 یا جداشده با کاما)."""
+    keys = []
+    for env_name in ("GEMINI_API_KEY", "GEMINI_API_KEY_2", "GEMINI_API_KEY_3"):
+        val = os.getenv(env_name, "").strip()
+        if val:
+            keys.extend(k.strip() for k in val.split(",") if k.strip())
+    seen, out = set(), []
+    for k in keys:
+        if k not in seen:
+            seen.add(k)
+            out.append(k)
+    return out
+
+
 async def prepare_viral_daily_editorial(session: aiohttp.ClientSession, items: list) -> dict:
-    """آماده‌سازی تیترها و کلمات کلیدی؛ برای خبرهای تایید/اصلاح‌شده دقیقاً همان متن کاربر بدون تغییر حفظ می‌شود."""
+    """آماده‌سازی تیترها و کلمات کلیدی؛ متن خبرهای تاییدشده روی تصویر ثابت می‌ماند و فقط برای گفتار اعراب‌گذاری دقیق می‌شود."""
     selected = items[:8]
+    diac_strip = re.compile(r"[\u064b-\u0652\u0670]+")
 
     def finalize_complete_sentence(s: str, limit: int = 120) -> str:
         t = smart_truncate_words(sanitize_display_headline(s), limit)
@@ -1283,7 +1328,7 @@ async def prepare_viral_daily_editorial(session: aiohttp.ClientSession, items: l
         fallback_items.append({
             "display_headline": hl,
             "highlight_words": words[:2],
-            "spoken_text": apply_pronunciation_dict(hl),
+            "spoken_text": normalize_text_for_persian_tts(hl),
         })
     fallback = {
         "items": fallback_items,
@@ -1301,8 +1346,8 @@ async def prepare_viral_daily_editorial(session: aiohttp.ClientSession, items: l
 
     extra_rules = (
         "\nقواعد تکمیلی اجباری:\n"
-        "- برای هر خبری که برچسب [متن تاییدشده و قفل کاربر] دارد، display_headline باید ۱۰۰٪ عیناً همان متن باشد و در spoken_text فقط روی همان کلمات اعراب‌گذاری دقیق انجام بده و هیچ کلمه‌ای کم یا زیاد نکن.\n"
-        "- برای سایر خبرها اگر متن طولانی است، آن را به یک جمله کاملاً تمام‌شده (۷ تا ۱۲ کلمه) خلاصه کن و هرگز با حرف اضافه معلق (با، در، از، به، و، را، که) تمام نکن."
+        "- برای هر خبری که برچسب [متن تاییدشده و قفل کاربر] دارد، display_headline باید ۱۰۰٪ عیناً همان متن باشد و در spoken_text دقیقاً همان کلمات را فقط با اعراب‌گذاری هوشمند روی کلمات حساس (مثل شُهَدایِ، قُبورِ، عَمَلکَردِ، مَمَسَنی) و تبدیل حروف انگلیسی (مثل QR به کیو آر) برگردان و هیچ کلمه‌ای کم یا زیاد نکن.\n"
+        "- برای سایر خبرها اگر متن طولانی است، آن را به یک جمله کاملاً تمام‌شده (۷ تا ۱۲ کلمه) خلاصه کن و هرگز با حرف اضافه معلق تمام نکن."
     )
     raw = await gemini_generate(session, f"{VIRAL_DAILY_BATCH_PROMPT}{extra_rules}\n\nخبرهای امروز:\n{numbered}")
     if not raw:
@@ -1320,14 +1365,16 @@ async def prepare_viral_daily_editorial(session: aiohttp.ClientSession, items: l
             if idx < len(p_items) and isinstance(p_items[idx], dict):
                 kws = [strip_emojis_for_font(str(k)).strip("،.؛:!؟«»") for k in (p_items[idx].get("highlight_words") or []) if str(k).strip()]
                 if is_locked:
-                    # قفل قطعی روی متن تاییدشده کاربر (هم در تصویر و هم در گفتار)
                     d_hl = fb["display_headline"]
                     sp_cand = sanitize_display_headline(str(p_items[idx].get("spoken_text", "")))
-                    # فقط در صورتی spoken_text هوش مصنوعی پذیرفته می‌شود که طولش هم‌اندازه متن کاربر باشد (صرفاً اعراب‌گذاری کرده باشد)
-                    sp = apply_pronunciation_dict(sp_cand) if (sp_cand and abs(len(sp_cand.split()) - len(d_hl.split())) <= 1) else fb["spoken_text"]
+                    same_words = bool(sp_cand) and (
+                        diac_strip.sub("", normalize_text_for_persian_tts(sp_cand)).split()
+                        == diac_strip.sub("", normalize_text_for_persian_tts(d_hl)).split()
+                    )
+                    sp = normalize_text_for_persian_tts(sp_cand) if same_words else fb["spoken_text"]
                 else:
                     d_hl = finalize_complete_sentence(str(p_items[idx].get("display_headline", "")), 115) or fb["display_headline"]
-                    sp = apply_pronunciation_dict(finalize_complete_sentence(str(p_items[idx].get("spoken_text", "")), 150) or d_hl)
+                    sp = normalize_text_for_persian_tts(finalize_complete_sentence(str(p_items[idx].get("spoken_text", "")), 150) or d_hl)
                 out_items.append({
                     "display_headline": d_hl,
                     "highlight_words": kws[:3] if kws else fb["highlight_words"],
@@ -1364,16 +1411,28 @@ async def _tts_via_elevenlabs(session: aiohttp.ClientSession, text: str, raw_out
     return False
 
 
-async def _tts_via_gemini_native(session: aiohttp.ClientSession, text: str, raw_wav_out: str, is_female: bool = False) -> bool:
-    """موتور صوتی اختصاصی Gemini Native TTS با صبر هوشمند روی محدودیت 429 برای صدای ۱۰۰٪ یکدست و متفاوت."""
-    if not GEMINI_API_KEY:
-        return False
+async def _tts_via_gemini_native(
+    session: aiohttp.ClientSession,
+    text: str,
+    raw_wav_out: str,
+    is_female: bool = False,
+    exhausted_pairs: set = None,
+) -> tuple:
+    """موتور صوتی Gemini Native TTS (دقیقاً صدای کلیپ اول) با چرخش خودکار روی هر ۲ مدل TTS و مدیریت دقیق 429."""
+    keys = get_gemini_tts_keys()
+    if not keys:
+        return False, "کلید GEMINI_API_KEY تنظیم نشده است."
+
+    if exhausted_pairs is None:
+        exhausted_pairs = set()
+
     voice_name = "Kore" if is_female else "Charon"
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key={GEMINI_API_KEY}"
+    tts_models = ["gemini-2.5-flash-preview-tts", "gemini-2.5-pro-preview-tts"]
     styled_prompt = (
-        "Read this Persian TV news bulletin segment in a crisp, natural, energetic Iranian news anchor voice. "
-        "Pronounce every Persian word and Fars province place name accurately according to the diacritics "
-        "(e.g. Mamasani = مَمَسَنی, Beyza = بَیضا, khabar = خَبَر), with confident pacing and zero hesitation:\n"
+        "Read this short Persian TV news item in a crisp, natural, authoritative, energetic Iranian news anchor voice. "
+        "CRITICAL: If the text starts with a news number like 'خبرِ اول.' or 'خبرِ دوم.', stop completely at the period with a brief pause "
+        "and NEVER attach an ezafe to link the number to the next word. "
+        "Pronounce every Persian word, diacritic, and Fars place name accurately (e.g. مَمَسَنی، بَیضا، شُهَدایِ، قُبورِ، جَهرُم):\n"
         f"{text}"
     )
     body = {
@@ -1383,52 +1442,68 @@ async def _tts_via_gemini_native(session: aiohttp.ClientSession, text: str, raw_
             "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice_name}}},
         },
     }
-    backoffs = [12.0, 22.0, 32.0, 42.0]
-    for attempt in range(len(backoffs) + 1):
-        try:
-            async with session.post(url, json=body, timeout=aiohttp.ClientTimeout(total=60)) as resp:
-                if resp.status in (429, 503):
-                    if attempt < len(backoffs):
-                        wait_s = backoffs[attempt]
-                        try:
+
+    last_err = "پاسخ صوتی از Gemini دریافت نشد."
+    for round_idx in range(4):
+        any_available = False
+        min_wait = 22.0
+        for api_key in keys:
+            for model_name in tts_models:
+                pair = (api_key, model_name)
+                if pair in exhausted_pairs:
+                    continue
+                any_available = True
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+                try:
+                    async with session.post(url, json=body, timeout=aiohttp.ClientTimeout(total=65)) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            cands = data.get("candidates") or []
+                            for p in ((cands[0].get("content", {}).get("parts") or []) if cands else []):
+                                inline = p.get("inlineData") or p.get("inline_data")
+                                if inline and inline.get("data"):
+                                    raw_bytes = base64.b64decode(inline["data"])
+                                    if len(raw_bytes) < 400:
+                                        continue
+                                    mime = (inline.get("mimeType") or inline.get("mime_type") or "").lower()
+                                    if any(x in mime for x in ("wav", "mp3", "mpeg", "ogg")):
+                                        with open(raw_wav_out, "wb") as f:
+                                            f.write(raw_bytes)
+                                        return True, ""
+                                    sr_m = re.search(r"rate=(\d+)", mime)
+                                    sr = int(sr_m.group(1)) if sr_m else 24000
+                                    with wave.open(raw_wav_out, "wb") as wf:
+                                        wf.setnchannels(1)
+                                        wf.setsampwidth(2)
+                                        wf.setframerate(sr)
+                                        wf.writeframes(raw_bytes)
+                                    return True, ""
+                            last_err = f"مدل {model_name} خروجی صوتی برنگرداند."
+                        elif resp.status == 429:
                             err_txt = await resp.text()
-                            rm = re.search(r"retryDelay\"\s*:\s*\"(\d+(?:\.\d+)?)s", err_txt)
-                            if rm:
-                                wait_s = min(65.0, float(rm.group(1)) + 2.0)
-                        except Exception:
-                            pass
-                        await asyncio.sleep(wait_s)
-                        continue
-                    return False
-                if resp.status != 200:
-                    return False
-                data = await resp.json()
-                cands = data.get("candidates") or []
-                if not cands:
-                    return False
-                for p in (cands[0].get("content", {}).get("parts") or []):
-                    inline = p.get("inlineData") or p.get("inline_data")
-                    if inline and inline.get("data"):
-                        raw_bytes = base64.b64decode(inline["data"])
-                        if len(raw_bytes) < 400:
-                            return False
-                        mime = (inline.get("mimeType") or inline.get("mime_type") or "").lower()
-                        if "wav" in mime or "mp3" in mime or "mpeg" in mime or "ogg" in mime:
-                            with open(raw_wav_out, "wb") as f:
-                                f.write(raw_bytes)
-                            return True
-                        sr_m = re.search(r"rate=(\d+)", mime)
-                        sr = int(sr_m.group(1)) if sr_m else 24000
-                        with wave.open(raw_wav_out, "wb") as wf:
-                            wf.setnchannels(1)
-                            wf.setsampwidth(2)
-                            wf.setframerate(sr)
-                            wf.writeframes(raw_bytes)
-                        return True
-        except Exception:
-            if attempt < 2:
-                await asyncio.sleep(3.0)
-    return False
+                            low_err = err_txt.lower()
+                            if ("perday" in low_err) or ("requestsperday" in low_err) or ("daily" in low_err):
+                                exhausted_pairs.add(pair)
+                                last_err = "سهمیه روزانه صدای Gemini TTS روی این کلید پر شده است."
+                            else:
+                                rm = re.search(r'retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s', err_txt)
+                                w_s = min(62.0, float(rm.group(1)) + 2.0) if rm else 23.0
+                                min_wait = min(min_wait, w_s)
+                                last_err = "محدودیت تعداد درخواست در دقیقه Gemini TTS (429)."
+                        elif resp.status in (400, 403, 404):
+                            exhausted_pairs.add(pair)
+                            last_err = f"مدل {model_name} در دسترس نیست (کد {resp.status})."
+                        else:
+                            last_err = f"خطای موقت سرور Gemini (کد {resp.status})."
+                except Exception as e:
+                    last_err = str(e)
+
+        if not any_available or len(exhausted_pairs) >= len(keys) * len(tts_models):
+            return False, last_err
+        if round_idx < 3:
+            await asyncio.sleep(min_wait)
+
+    return False, last_err
 
 
 async def synthesize_broadcast_tts(
@@ -1437,24 +1512,27 @@ async def synthesize_broadcast_tts(
     out_wav: str,
     work_dir: str,
     already_diacritized: bool = False,
-    lock_engine: str = "",
+    allow_edge_fallback: bool = False,
+    exhausted_pairs: set = None,
 ) -> tuple:
-    """تولید صدای یکدست گوینده خبری با قفل موتور صوتی (هرگز وسط ویدیو صدای گوینده عوض نمی‌شود)."""
-    diac_text = apply_pronunciation_dict(raw_text) if already_diacritized else await diacritize_persian_for_tts(session, raw_text)
+    """تولید صدای اختصاصی گوینده خبری (ElevenLabs یا Gemini TTS). در سبک ۶ هرگز روی FaridNeural تکراری نمی‌افتد."""
+    diac_text = normalize_text_for_persian_tts(raw_text) if already_diacritized else normalize_text_for_persian_tts(await diacritize_persian_for_tts(session, raw_text))
     is_female = CONFIG.get("tts_profile") == "studio_anchor_f"
     raw_in = os.path.join(work_dir, f"tts_src_{int(time.time()*1000)}_{random.randint(10,99)}.wav")
     engine_used = ""
+    err_reason = ""
 
-    # اگر موتور قفل شده، فقط از همان موتور برای تمام اسلایدها استفاده می‌کنیم تا صدا دوگانه نشود
-    if (not lock_engine or lock_engine == "ElevenLabs") and ELEVENLABS_API_KEY:
-        if await _tts_via_elevenlabs(session, diac_text, raw_in):
-            engine_used = "ElevenLabs"
+    if ELEVENLABS_API_KEY and await _tts_via_elevenlabs(session, diac_text, raw_in):
+        engine_used = "ElevenLabs"
 
-    if not engine_used and (not lock_engine or lock_engine == "Gemini TTS") and GEMINI_API_KEY:
-        if await _tts_via_gemini_native(session, diac_text, raw_in, is_female=is_female):
+    if not engine_used:
+        ok_gem, err_reason = await _tts_via_gemini_native(
+            session, diac_text, raw_in, is_female=is_female, exhausted_pairs=exhausted_pairs
+        )
+        if ok_gem:
             engine_used = "Gemini TTS"
 
-    if not engine_used and (not lock_engine or lock_engine == "پشتیبان صوتی") and HAS_EDGE_TTS and edge_tts is not None:
+    if not engine_used and allow_edge_fallback and HAS_EDGE_TTS and edge_tts is not None:
         raw_mp3 = os.path.join(work_dir, f"tts_fb_{int(time.time()*1000)}_{random.randint(10,99)}.mp3")
         v_name = "fa-IR-DilaraNeural" if is_female else "fa-IR-FaridNeural"
         try:
@@ -1466,7 +1544,7 @@ async def synthesize_broadcast_tts(
             pass
 
     if not engine_used or not os.path.exists(raw_in):
-        return 0.0, ""
+        return 0.0, err_reason
 
     dsp_chain = (
         "aresample=44100,"
@@ -1484,8 +1562,8 @@ async def synthesize_broadcast_tts(
             "-ar", "44100", "-ac", "2", "-c:a", "pcm_s16le", out_wav,
         ])
         return probe_audio_duration(out_wav), engine_used
-    except Exception:
-        return 0.0, ""
+    except Exception as e:
+        return 0.0, str(e)
         
 
 # ==================== کیبوردهای دسته‌بندی‌شده جدید (منوی اصلی خلوت ۲×۲) ====================
@@ -2445,7 +2523,7 @@ def build_mastered_reel_audio_sync(
     mode: str = "news",
     voice_wav: str = "",
 ) -> tuple:
-    """مسترینگ صدای ریلز: موزیک پس‌زمینه + افکت هوای سینمایی Whoosh (بدون صدای قطره آب) + داکینگ خودکار زیر صدای گوینده."""
+    """مسترینگ تمیز صدای ریلز: داکینگ نرم موزیک زیر صدای گوینده + افکت برودکست ظریف (بدون صدای خِش/نفس‌کشیدن روی کات‌ها)."""
     sr = 44100
     n_samples = max(sr, int(round(total_sec * sr)))
     bg_src = get_audio_track(work_dir, total_sec + 2.0, mode=mode)
@@ -2466,17 +2544,13 @@ def build_mastered_reel_audio_sync(
 
     bg_arr = read_stereo_float(bg_wav, n_samples)
 
-    # افکت صوتی حرفه‌ای Whoosh برودکست (فقط هوای گذرا + بیس بسیار نرم 68Hz به 40Hz؛ بدون هیچ صدای قطره آب)
-    w_len = int(0.28 * sr)
-    wt = np.linspace(0.0, 0.28, w_len, endpoint=False, dtype=np.float32)
-    rng = np.random.default_rng(19)
-    raw_n = rng.normal(0.0, 1.0, w_len).astype(np.float32)
-    lp_wide = np.convolve(raw_n, np.ones(26, dtype=np.float32) / 26.0, mode="same")
-    lp_narrow = np.convolve(raw_n, np.ones(110, dtype=np.float32) / 110.0, mode="same")
-    air_whoosh = (lp_wide - lp_narrow) * (np.sin(np.pi * (wt / 0.28)) ** 1.8) * 1.45
-    freq_sweep = 68.0 - 28.0 * (wt / 0.28)
-    sub_thump = 0.22 * np.sin(2.0 * np.pi * np.cumsum(freq_sweep) / sr) * np.exp(-wt * 14.0)
-    sfx_mono = (air_whoosh + sub_thump) * 0.34
+    # افکت کات تمیز و حرفه‌ای تلویزیونی (پالس بم بسیار نرم + زنگوله ظریف — بدون هیچ نویز سفید مزاحم)
+    w_len = int(0.18 * sr)
+    wt = np.linspace(0.0, 0.18, w_len, endpoint=False, dtype=np.float32)
+    freq_sweep = 105.0 - 50.0 * (wt / 0.18)
+    sub_pulse = 0.20 * np.sin(2.0 * np.pi * np.cumsum(freq_sweep) / sr) * np.exp(-wt * 22.0)
+    soft_chime = 0.055 * np.sin(2.0 * np.pi * 660.0 * wt) * np.exp(-wt * 28.0)
+    sfx_mono = (sub_pulse + soft_chime).astype(np.float32)
     sfx_stereo = np.stack([sfx_mono, sfx_mono], axis=-1)
 
     if voice_wav and os.path.exists(voice_wav):
@@ -2494,7 +2568,7 @@ def build_mastered_reel_audio_sync(
         eq_source = np.max(np.abs(bg_arr), axis=1)
 
     for ct in cut_times:
-        idx0 = int(max(0, (ct - 0.14) * sr))
+        idx0 = int(max(0, (ct - 0.09) * sr))
         idx1 = min(n_samples, idx0 + w_len)
         if idx1 > idx0:
             mix[idx0:idx1] += sfx_stereo[:idx1 - idx0]
@@ -2525,80 +2599,73 @@ def build_mastered_reel_audio_sync(
 
 
 async def prepare_hologram_narration_audio(session: aiohttp.ClientSession, items: list, editorial: dict, work_dir: str) -> dict:
-    """تولید گویندگی جداگانه برای هر اسلاید با سینک ۱۰۰٪ دقیق و قفل کامل روی Gemini TTS (یا ElevenLabs)."""
+    """تولید گویندگی ۱۰۰٪ یکدست با صدای اختصاصی Gemini TTS (مشابه کلیپ اول)؛ بدون سقوط روی FaridNeural و بدون هیچ اسلاید بی‌صدا."""
     ed_items = editorial.get("items") or []
-    ordinals = ["خَبَرِ اوّل؛", "خَبَرِ دُوُم؛", "خَبَرِ سِوُم؛", "خَبَرِ چَهارُم؛", "خَبَرِ پَنجُم؛", "خَبَرِ شِشُم؛", "خَبَرِ هَفتُم؛", "خَبَرِ هَشتُم؛"]
+    ordinals = ["خَبَرِ اوّل.", "خَبَرِ دُوُم.", "خَبَرِ سِوُم.", "خَبَرِ چَهارُم.", "خَبَرِ پَنجُم.", "خَبَرِ شِشُم.", "خَبَرِ هَفتُم.", "خَبَرِ هَشتُم."]
 
-    scripts = ["شَصت ثانیِه با مُهِم‌ترین اَخبار!"]
+    scripts = [("intro", "شصت ثانیه با مُهِم‌ترین اخبار.")]
     for idx, ed in enumerate(ed_items):
-        ord_p = ordinals[idx] if idx < len(ordinals) else f"خَبَرِ {idx + 1}؛"
-        sp = apply_pronunciation_dict(ed.get("spoken_text") or ed.get("display_headline") or "")
-        scripts.append(f"{ord_p} {sp}.")
-    scripts.append("بَرایِ مُهِم‌ترین خَبَرهایِ ایران و شیراز فالو کُنید.")
+        ord_p = ordinals[idx] if idx < len(ordinals) else f"خَبَرِ {idx + 1}."
+        sp = normalize_text_for_persian_tts(ed.get("spoken_text") or ed.get("display_headline") or "")
+        scripts.append((f"news_{idx}", f"{ord_p}\n{sp}."))
+    scripts.append(("outro", "بَرایِ مُهِم‌ترین خَبَرهایِ ایران و شیراز فالو کُنید."))
+
+    profile_tag = CONFIG.get("tts_profile", "studio_baritone")
+    cache_dir = os.path.join(TMP_ROOT, "tts_static_cache")
+    os.makedirs(cache_dir, exist_ok=True)
 
     seg_wavs = []
     seg_durs = []
-    # قفل پیش‌فرض روی موتور اختصاصی تا در شلوغی سرور هرگز وسط کار به صدای تکراری تغییر نکند
-    preferred_engine = "ElevenLabs" if ELEVENLABS_API_KEY else ("Gemini TTS" if GEMINI_API_KEY else "")
-    locked_engine = ""
+    exhausted_pairs = set()
+    engine_label = ""
 
-    await asyncio.sleep(2.5)
-
-    for k, sc_txt in enumerate(scripts):
-        if k > 0:
-            await asyncio.sleep(3.0 if (locked_engine or preferred_engine) == "Gemini TTS" else 0.5)
-
+    for k, (tag, sc_txt) in enumerate(scripts):
         w_p = os.path.join(work_dir, f"nar_{k:02d}.wav")
-        target_eng = locked_engine or preferred_engine
-        dur, eng = await synthesize_broadcast_tts(
-            session, sc_txt, w_p, work_dir,
-            already_diacritized=True, lock_engine=target_eng,
-        )
+        cache_p = os.path.join(cache_dir, f"{tag}_{profile_tag}.wav") if tag in ("intro", "outro") else ""
 
-        # در صورت محدودیت دقیقه‌ای Gemini TTS، صبر مجدد می‌کنیم تا همان صدای اختصاصی تولید شود
-        if dur <= 0.3 and target_eng == "Gemini TTS":
-            await asyncio.sleep(25.0)
-            dur, eng = await synthesize_broadcast_tts(
-                session, sc_txt, w_p, work_dir,
-                already_diacritized=True, lock_engine="Gemini TTS",
-            )
-
-        # فقط اگر در اولین اسلاید موتور اصلی کاملاً از دسترس خارج بود، به موتور آزاد اجازه اجرا می‌دهیم
-        if dur <= 0.3 and not locked_engine:
-            dur, eng = await synthesize_broadcast_tts(
-                session, sc_txt, w_p, work_dir,
-                already_diacritized=True, lock_engine="",
-            )
-
-        if dur > 0.3 and os.path.exists(w_p):
-            if not locked_engine:
-                locked_engine = eng
-            padded = os.path.join(work_dir, f"nar_pad_{k:02d}.wav")
-            if k == 0:
-                target_d = max(2.0, min(3.2, dur + 0.30))
-                delay_ms = 100
-            elif k == len(scripts) - 1:
-                target_d = max(2.6, dur + 0.42)
-                delay_ms = 100
-            else:
-                target_d = max(3.2, dur + 0.48)
-                delay_ms = 160
-            run_ffmpeg([
-                "ffmpeg", "-y", "-i", w_p,
-                "-af", f"adelay={delay_ms}|{delay_ms},apad=whole_dur={target_d:.2f}",
-                "-ar", "44100", "-ac", "2", padded,
-            ])
-            seg_wavs.append(padded)
-            seg_durs.append(target_d)
+        if cache_p and os.path.exists(cache_p) and os.path.getsize(cache_p) > 2000:
+            shutil.copy(cache_p, w_p)
+            dur = probe_audio_duration(w_p)
+            eng = engine_label or "Gemini TTS"
         else:
-            sil = os.path.join(work_dir, f"sil_{k:02d}.wav")
-            def_d = 2.1 if k == 0 else (2.6 if k == len(scripts) - 1 else 3.8)
-            run_ffmpeg(["ffmpeg", "-y", "-f", "lavfi", "-t", f"{def_d:.2f}", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100", sil])
-            seg_wavs.append(sil)
-            seg_durs.append(def_d)
+            if k > 0 and not ELEVENLABS_API_KEY:
+                await asyncio.sleep(3.5)
+            dur, eng = await synthesize_broadcast_tts(
+                session, sc_txt, w_p, work_dir,
+                already_diacritized=True,
+                allow_edge_fallback=False,
+                exhausted_pairs=exhausted_pairs,
+            )
+            if dur <= 0.3 or not os.path.exists(w_p):
+                raise RuntimeError(
+                    f"تولید صدای اختصاصی روی بخش «{tag}» متوقف شد تا ویدیو با صدای تکراری یا بی‌صدا خراب نشود.\n"
+                    f"دلیل دقیق: {eng}\n"
+                    "💡 راه‌حل سریع: چند دقیقه بعد دوباره بزنید، یا در Settings > Secrets گیت‌هاب یک کلید رایگان دوم با نام GEMINI_API_KEY_2 (یا کلید ELEVENLABS_API_KEY) اضافه کنید تا سهمیه دو برابر شود."
+                )
+            if cache_p:
+                try:
+                    shutil.copy(w_p, cache_p)
+                except Exception:
+                    pass
 
-    if not locked_engine:
-        return {"voice_wav": "", "durs": seg_durs, "narrated": False, "engine": ""}
+        engine_label = eng
+        padded = os.path.join(work_dir, f"nar_pad_{k:02d}.wav")
+        if tag == "intro":
+            target_d = max(2.0, min(3.2, dur + 0.30))
+            delay_ms = 100
+        elif tag == "outro":
+            target_d = max(2.6, dur + 0.42)
+            delay_ms = 100
+        else:
+            target_d = max(3.2, dur + 0.48)
+            delay_ms = 160
+        run_ffmpeg([
+            "ffmpeg", "-y", "-i", w_p,
+            "-af", f"adelay={delay_ms}|{delay_ms},apad=whole_dur={target_d:.2f}",
+            "-ar", "44100", "-ac", "2", padded,
+        ])
+        seg_wavs.append(padded)
+        seg_durs.append(target_d)
 
     list_f = os.path.join(work_dir, "nar_list.txt")
     with open(list_f, "w") as f:
@@ -2606,7 +2673,7 @@ async def prepare_hologram_narration_audio(session: aiohttp.ClientSession, items
             f.write(f"file '{sw}'\n")
     voice_full = os.path.join(work_dir, "voice_full.wav")
     run_ffmpeg(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_f, "-c", "copy", voice_full])
-    return {"voice_wav": voice_full, "durs": seg_durs, "narrated": True, "engine": locked_engine}
+    return {"voice_wav": voice_full, "durs": seg_durs, "narrated": True, "engine": engine_label}
 
 
 def _tokenize_line_metrics(draw: ImageDraw.ImageDraw, words: list, font: ImageFont.FreeTypeFont, hw_norm: set, has_pill: bool):
